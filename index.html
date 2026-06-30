@@ -122,7 +122,7 @@ function buildSeed() {
   const mkActive = (ei, si, h, lat, lng, task) => { const s = new Date(); s.setHours(s.getHours()-h,12,0,0); entries.push({ id: uuid(), employeeId: employees[ei].id, siteId: sites[si].id, clockIn: s.toISOString(), clockOut: null, lat, lng, task }); };
   mkActive(0,0,3,42.9398,-73.8521,"Framing");
   mkActive(1,1,2,43.0712,-73.7846,"Trim & Finish");
-  return { employees, sites, entries, tasks: [...DEFAULT_TASKS] };
+  return { employees, sites, entries, tasks: [...DEFAULT_TASKS], trades: [...TRADE_OPTIONS] };
 }
 
 /* ===================== helpers ===================== */
@@ -175,8 +175,8 @@ function buildStaffingRead({ matrix, types, taskRows, totalHours }) {
 function App() {
   const [data, setData] = useState(() => {
     const c = cache.load();
-    if (c) { if (!c.tasks) c.tasks = [...DEFAULT_TASKS]; if (!c.edits) c.edits = []; return c; }
-    if (IS_CLOUD) return { employees: [], sites: [], tasks: [], entries: [], edits: [] };
+    if (c) { if (!c.tasks) c.tasks = [...DEFAULT_TASKS]; if (!c.edits) c.edits = []; if (!c.trades) c.trades = [...TRADE_OPTIONS]; return c; }
+    if (IS_CLOUD) return { employees: [], sites: [], tasks: [], entries: [], edits: [], trades: [...TRADE_OPTIONS] };
     const s = buildSeed(); s.edits = []; cache.save(s); return s;
   });
   const [tab, setTab] = useState("clock");
@@ -184,6 +184,7 @@ function App() {
   const [now, setNow] = useState(new Date());
   const [online, setOnline] = useState(navigator.onLine);
   const [pending, setPending] = useState(outboxCount(loadOutbox()));
+  const [toast, setToast] = useState(null);
   const [syncState, setSyncState] = useState(IS_CLOUD ? "loading" : "local"); // loading | ok | error | local
   const [cloudPin, setCloudPin] = useState(null);
   const [localPin, setLocalPin] = useState(() => localStorage.getItem("gangbox_local_pin") || "1234");
@@ -192,6 +193,8 @@ function App() {
   const dataRef = useRef(data);
   const outbox = useRef(loadOutbox());
   const flushing = useRef(false);
+  const toastTimer = useRef(null);
+  const showToast = (msg, kind = "ok") => { setToast({ msg, kind }); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(null), 2800); };
 
   useEffect(() => { dataRef.current = data; cache.save(data); }, [data]);
 
@@ -203,13 +206,14 @@ function App() {
   const refresh = async () => {
     if (!IS_CLOUD) return;
     try {
-      const [e, s, t, en, st, ed] = await Promise.all([
+      const [e, s, t, en, st, ed, tr] = await Promise.all([
         client.from("employees").select("*").order("name"),
         client.from("sites").select("*").order("created_at"),
         client.from("tasks").select("*").order("created_at"),
         client.from("entries").select("*").order("clock_in"),
         client.from("settings").select("*").eq("id", 1).maybeSingle(),
         client.from("edits").select("*").order("changed_at", { ascending: false }).limit(500),
+        client.from("trades").select("*").order("created_at"),
       ]);
       if (e.error || s.error || t.error || en.error || ed.error) throw (e.error || s.error || t.error || en.error || ed.error);
       setData(prev => ({
@@ -218,6 +222,7 @@ function App() {
         tasks: (t.data || []).map(r => r.label),
         entries: (en.data || []).map(mapEntry),
         edits: (ed.data || []).map(mapEdit),
+        trades: (tr && tr.data && tr.data.length) ? tr.data.map(r => r.label) : ((prev.trades && prev.trades.length) ? prev.trades : [...TRADE_OPTIONS]),
       }));
       if (st && st.data) setCloudPin(st.data.manager_pin || null);
       setSyncState("ok");
@@ -250,6 +255,7 @@ function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, refresh)
       .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, refresh)
       .on("postgres_changes", { event: "*", schema: "public", table: "edits" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "trades" }, refresh)
       .subscribe();
     const poll = setInterval(refresh, 30000);
     return () => { clearInterval(poll); client.removeChannel(ch); };
@@ -337,14 +343,25 @@ function App() {
     setData(d => ({ ...d, sites: [...d.sites, row] }));
     if (IS_CLOUD) client.from("sites").insert({ id: row.id, name: s.name, customer: s.customer, address: s.address, type: s.type, bill_rate: s.billRate }).then(({ error }) => { if (error) alert("Couldn't save job site: " + error.message); });
   };
+  const addTrade = (label) => {
+    const l = (label || "").trim(); if (!l || dataRef.current.trades.includes(l)) return;
+    setData(d => ({ ...d, trades: [...d.trades, l] }));
+    if (IS_CLOUD) client.from("trades").insert({ id: uuid(), label: l }).then(({ error }) => { showToast(error && error.code !== "23505" ? "Couldn't add trade: " + error.message : `Added trade “${l}”`, error && error.code !== "23505" ? "err" : "ok"); });
+    else showToast(`Added trade “${l}”`, "ok");
+  };
+  const removeTrade = (label) => {
+    setData(d => ({ ...d, trades: d.trades.filter(t => t !== label) }));
+    if (IS_CLOUD) client.from("trades").delete().eq("label", label).then(({ error }) => { showToast(error ? "Couldn't remove trade: " + error.message : `Removed trade “${label}”`, error ? "err" : "ok"); });
+    else showToast(`Removed trade “${label}”`, "ok");
+  };
   const changePin = (p) => {
-    if (IS_CLOUD) { setCloudPin(p); client.from("settings").upsert({ id: 1, manager_pin: p }).then(({ error }) => { if (error) alert("Couldn't update PIN: " + error.message); }); }
-    else { localStorage.setItem("gangbox_local_pin", p); setLocalPin(p); }
+    if (IS_CLOUD) { setCloudPin(p); client.from("settings").upsert({ id: 1, manager_pin: p }).then(({ error }) => { showToast(error ? "Couldn't update PIN: " + error.message : "Manager PIN updated", error ? "err" : "ok"); }); }
+    else { localStorage.setItem("gangbox_local_pin", p); setLocalPin(p); showToast("Manager PIN updated", "ok"); }
   };
   const resetLocal = () => { if (confirm("Reset all data back to the sample crew and jobs on this device?")) { const s = buildSeed(); setData(s); } };
 
   const effectivePin = IS_CLOUD ? cloudPin : localPin;
-  const unlock = () => { setUnlocked(true); localStorage.setItem("gangbox_unlocked", "1"); };
+  const unlock = () => { setUnlocked(true); localStorage.setItem("gangbox_unlocked", "1"); showToast("Manager view unlocked", "ok"); };
   const lock = () => { setUnlocked(false); localStorage.removeItem("gangbox_unlocked"); };
 
   const managerTab = tab === "sites" || tab === "crew" || tab === "reports";
@@ -356,12 +373,13 @@ function App() {
       {syncState === "error" && IS_CLOUD && (
         <div style={styles.errBanner}>Can't reach the database — showing last synced data. New punches will upload when it reconnects.</div>
       )}
+      {toast && <div style={{ ...styles.toast, ...(toast.kind === "ok" ? styles.toastOk : styles.toastErr) }}>{(toast.kind === "ok" ? "✓ " : "⚠ ") + toast.msg}</div>}
       <main style={styles.main}>
         {tab === "clock" && <ClockTab data={data} now={now} empById={empById} siteById={siteById} onClockIn={clockIn} onClockOut={clockOut} onSetTask={setTask} onAddTaskType={addTaskType} onOpenCard={(id) => { setCardEmp(id); setTab("cards"); }} />}
         {tab === "cards" && <CardsTab data={data} now={now} empById={empById} siteById={siteById} initialEmp={cardEmp} onEdit={editEntryFields} onCreate={addMissedShift} onDelete={deleteEntry} />}
         {needPin && <PinGate effectivePin={effectivePin} onUnlock={unlock} onCreate={(p) => { changePin(p); unlock(); }} />}
         {!needPin && tab === "sites" && <SitesTab data={data} now={now} onAdd={addSite} />}
-        {!needPin && tab === "crew" && <CrewTab data={data} now={now} onAdd={addEmployee} />}
+        {!needPin && tab === "crew" && <CrewTab data={data} now={now} onAdd={addEmployee} trades={data.trades} onAddTrade={addTrade} onRemoveTrade={removeTrade} />}
         {!needPin && tab === "reports" && <ReportsTab data={data} now={now} empById={empById} siteById={siteById} isCloud={IS_CLOUD} onReset={resetLocal} onLock={lock} onChangePin={changePin} />}
       </main>
       <Nav tab={tab} setTab={setTab} />
@@ -728,14 +746,14 @@ function SitesTab({ data, now, onAdd }) {
 }
 
 /* ===================== crew ===================== */
-function CrewTab({ data, now, onAdd }) {
+function CrewTab({ data, now, onAdd, trades, onAddTrade, onRemoveTrade }) {
   const [open, setOpen] = useState(false);
   const totals = {}; data.entries.forEach(e => { totals[e.employeeId] = (totals[e.employeeId] || 0) + hoursOf(e, now); });
   const active = new Set(data.entries.filter(e => !e.clockOut).map(e => e.employeeId));
   return (
     <div>
       <SectionLabel n="01" action={<AddBtn open={open} onClick={() => setOpen(o => !o)} />}>Crew</SectionLabel>
-      {open && <AddCrewForm onAdd={(n, t) => { onAdd(n, t); setOpen(false); }} />}
+      {open && <AddCrewForm trades={trades} onAdd={(n, t) => { onAdd(n, t); setOpen(false); }} />}
       {data.employees.length === 0 && !open && <Empty>No crew yet. Tap “+ Add” to add your first crew member.</Empty>}
       <div style={{ display: "grid", gap: 10 }}>
         {data.employees.map((e) => (
@@ -746,6 +764,28 @@ function CrewTab({ data, now, onAdd }) {
             </div>
           </div>
         ))}
+      </div>
+      <SectionLabel n="02">Trades</SectionLabel>
+      <TradeManager trades={trades} onAdd={onAddTrade} onRemove={onRemoveTrade} />
+    </div>
+  );
+}
+
+function TradeManager({ trades, onAdd, onRemove }) {
+  const [draft, setDraft] = useState("");
+  const commit = () => { const t = draft.trim(); if (!t) return; onAdd(t); setDraft(""); };
+  return (
+    <div style={styles.card}>
+      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>These are the trade options shown when adding a crew member. Removing one here doesn't change anyone already assigned to it.</div>
+      <div style={styles.taskGrid}>
+        {trades.map(t => (
+          <span key={t} style={styles.tradeChipManage}>{t}<span style={styles.tradeX} onClick={() => { if (confirm(`Remove “${t}” from the trade list?`)) onRemove(t); }}>×</span></span>
+        ))}
+        {trades.length === 0 && <span style={{ fontSize: 13, color: T.inkSoft, fontStyle: "italic" }}>No trades yet — add one below.</span>}
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <input value={draft} placeholder="e.g. Plumber" onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === "Enter" && commit()} style={styles.input} />
+        <button style={{ ...styles.aiBtn, padding: "10px 16px" }} onClick={commit}>Add</button>
       </div>
     </div>
   );
@@ -926,9 +966,10 @@ function AddSiteForm({ onAdd }) {
     <button style={{ ...styles.aiBtn, opacity: ok ? 1 : 0.4 }} disabled={!ok} onClick={() => onAdd({ ...f, billRate: Number(f.billRate) || 0 })}>Save job site</button>
   </div>;
 }
-function AddCrewForm({ onAdd }) {
-  const [name, setName] = useState(""); const [trade, setTrade] = useState("Carpenter");
-  return <div style={styles.formCard}><Input label="Name" value={name} onChange={setName} /><Select label="Trade" value={trade} options={TRADE_OPTIONS} onChange={setTrade} /><button style={{ ...styles.aiBtn, opacity: name ? 1 : 0.4 }} disabled={!name} onClick={() => onAdd(name, trade)}>Add to crew</button></div>;
+function AddCrewForm({ onAdd, trades }) {
+  const opts = (trades && trades.length) ? trades : TRADE_OPTIONS;
+  const [name, setName] = useState(""); const [trade, setTrade] = useState(opts[0] || "Carpenter");
+  return <div style={styles.formCard}><Input label="Name" value={name} onChange={setName} /><Select label="Trade" value={trade} options={opts} onChange={setTrade} /><button style={{ ...styles.aiBtn, opacity: name ? 1 : 0.4 }} disabled={!name} onClick={() => onAdd(name, trade)}>Add to crew</button></div>;
 }
 function Input({ label, value, onChange }) { return <label style={{ display: "block", flex: 1 }}><div style={styles.fieldLabel}>{label}</div><input value={value} onChange={(e) => onChange(e.target.value)} style={styles.input} /></label>; }
 function Select({ label, value, options, onChange }) { return <label style={{ display: "block", flex: 1 }}><div style={styles.fieldLabel}>{label}</div><select value={value} onChange={(e) => onChange(e.target.value)} style={styles.input}>{options.map(o => <option key={o} value={o}>{o}</option>)}</select></label>; }
@@ -946,6 +987,11 @@ const styles = {
   syncPill: { fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, fontWeight: 600, letterSpacing: 0.3 },
   clockReadout: { fontFamily: "'JetBrains Mono',monospace", color: T.ticket, fontSize: 14, fontWeight: 600, textAlign: "right" },
   errBanner: { background: "#F6E3D2", color: T.warn, fontSize: 12.5, fontWeight: 600, padding: "8px 16px", textAlign: "center", borderBottom: `1px solid #E6C9AE` },
+  toast: { position: "sticky", top: 0, zIndex: 19, fontSize: 13, fontWeight: 600, padding: "10px 16px", textAlign: "center" },
+  toastOk: { background: T.activeSoft, color: T.active, borderBottom: `1px solid #BfDfCf` },
+  toastErr: { background: "#F6E3D2", color: T.warn, borderBottom: `1px solid #E6C9AE` },
+  tradeChipManage: { display: "inline-flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: T.steel, background: "#EDF1F3", border: `1px solid ${T.line}`, padding: "7px 8px 7px 12px", borderRadius: 20 },
+  tradeX: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 18, height: 18, borderRadius: "50%", background: "#D7DEE2", color: T.steel, fontSize: 14, lineHeight: 1, cursor: "pointer" },
   main: { flex: 1, padding: "20px 16px calc(100px + env(safe-area-inset-bottom))", overflowY: "auto" },
 
   pinWrap: { display: "flex", justifyContent: "center", paddingTop: 24 },
