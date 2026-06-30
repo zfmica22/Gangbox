@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>GANGBOX — Field time, job-costed</title>
+<meta name="theme-color" content="#15171B" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="icon" href="./favicon.png" />
+<link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<meta name="apple-mobile-web-app-title" content="GANGBOX" />
+<meta name="mobile-web-app-capable" content="yes" />
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap');
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #E4E1DA; }
+  body { font-family: 'Inter', system-ui, sans-serif; overscroll-behavior-y: none; }
+  button { cursor: pointer; font-family: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #F4A91F; outline-offset: 2px; }
+  input, select { font-family: inherit; }
+  ::-webkit-scrollbar { height: 6px; width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #CFCBC1; border-radius: 3px; }
+  @media (prefers-reduced-motion: reduce){ *{ transition:none!important; animation:none!important; } }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="./config.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+/* ===================== tokens ===================== */
+const T = {
+  concrete: "#E4E1DA", ticket: "#FBFAF7", ink: "#15171B", inkSoft: "#5A5E66",
+  steel: "#33485A", steelSoft: "#6B7E8C", amber: "#F4A91F", amberDeep: "#C9870F",
+  line: "#CFCBC1", active: "#2E7D5B", activeSoft: "#E2F0EA", warn: "#C0641A",
+};
+const HAZARD = `repeating-linear-gradient(45deg, ${T.amber} 0 13px, ${T.ink} 13px 26px)`;
+const TRADE_OPTIONS = ["Foreman", "Carpenter", "Finish Carpenter", "Mason", "Laborer", "Electrician", "Painter"];
+const TYPE_OPTIONS = ["New Build", "Remodel", "Exterior", "Foundation", "Finish", "Roofing"];
+const DEFAULT_TASKS = ["Framing","Drywall / Hang","Trim & Finish","Demo","Foundation / Concrete","Roofing","Decking","Site Prep / Cleanup","Punch List","Material Pickup"];
+
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+  : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => { const r = Math.random()*16|0, v = c==="x"?r:(r&0x3|0x8); return v.toString(16); }));
+
+/* ===================== config / client ===================== */
+const CFG = window.GANGBOX_CONFIG || {};
+const IS_CLOUD = !!(CFG.url && CFG.anonKey && window.supabase);
+const client = IS_CLOUD ? window.supabase.createClient(CFG.url, CFG.anonKey) : null;
+
+const CACHE_KEY = IS_CLOUD ? "gangbox_cloud_cache" : "gangbox_local_v1";
+const OUTBOX_KEY = "gangbox_outbox";
+const cache = {
+  load() { try { return JSON.parse(localStorage.getItem(CACHE_KEY)); } catch { return null; } },
+  save(d) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(d)); } catch {} },
+};
+const blankOutbox = () => ({ entries: {}, edits: {}, deletes: [] });
+const loadOutbox = () => {
+  try {
+    const r = JSON.parse(localStorage.getItem(OUTBOX_KEY));
+    if (!r) return blankOutbox();
+    if (r.entries || r.edits || r.deletes) return { entries: r.entries || {}, edits: r.edits || {}, deletes: r.deletes || [] };
+    return { entries: r, edits: {}, deletes: [] }; // migrate old flat shape
+  } catch { return blankOutbox(); }
+};
+const saveOutbox = (o) => { try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(o)); } catch {} };
+const outboxCount = (o) => Object.keys(o.entries).length + Object.keys(o.edits).length + o.deletes.length;
+
+/* db row <-> ui shape */
+const mapEmp = r => ({ id: r.id, name: r.name, trade: r.trade });
+const mapSite = r => ({ id: r.id, name: r.name, customer: r.customer, address: r.address, type: r.type, billRate: Number(r.bill_rate) || 0 });
+const mapEntry = r => ({ id: r.id, employeeId: r.employee_id, siteId: r.site_id, clockIn: r.clock_in, clockOut: r.clock_out, lat: r.lat, lng: r.lng, task: r.task || "" });
+const entryRow = e => ({ id: e.id, employee_id: e.employeeId, site_id: e.siteId, clock_in: e.clockIn, clock_out: e.clockOut, lat: e.lat, lng: e.lng, task: e.task || null });
+const mapEdit = r => ({ id: r.id, entryId: r.entry_id, employeeId: r.employee_id, employeeName: r.employee_name, action: r.action, field: r.field, oldValue: r.old_value, newValue: r.new_value, note: r.note, changedAt: r.changed_at });
+const auditRow = (o) => ({ id: o.id || uuid(), entry_id: o.entryId ?? null, employee_id: o.employeeId ?? null, employee_name: o.employeeName ?? null, action: o.action, field: o.field ?? null, old_value: o.oldValue ?? null, new_value: o.newValue ?? null, note: o.note ?? null, changed_at: new Date().toISOString() });
+
+/* ===================== local seed (local-only mode) ===================== */
+function buildSeed() {
+  const employees = [
+    { id: uuid(), name: "Mike Sullivan", trade: "Foreman" },
+    { id: uuid(), name: "Dave Russo", trade: "Carpenter" },
+    { id: uuid(), name: "Tyler Nguyen", trade: "Carpenter" },
+    { id: uuid(), name: "Carlos Mendez", trade: "Mason" },
+    { id: uuid(), name: "Jake Whitman", trade: "Laborer" },
+    { id: uuid(), name: "Sam Petrov", trade: "Finish Carpenter" },
+  ];
+  const sites = [
+    { id: uuid(), name: "Hilltop Custom Home", customer: "R. Delgado", address: "42 Maple Ave, Ballston Lake", type: "New Build", billRate: 95 },
+    { id: uuid(), name: "Bryant Kitchen Remodel", customer: "Bryant Family", address: "118 Caroline St, Saratoga Springs", type: "Remodel", billRate: 88 },
+    { id: uuid(), name: "Lakeview Deck & Porch", customer: "S. Okafor", address: "7 Lakeview Dr, Ballston Lake", type: "Exterior", billRate: 80 },
+    { id: uuid(), name: "Westcott Foundation", customer: "Westcott LLC", address: "330 Rt 50, Burnt Hills", type: "Foundation", billRate: 92 },
+  ];
+  const prefs = [[1,1,1,1],[1,3,2,0.4],[3,1,1,0.4],[0.8,0.3,0.3,4],[2,1,1,2],[1.4,3,0.6,0]];
+  const pick = (w) => { const t = w.reduce((a,b)=>a+b,0); let r = Math.random()*t; for (let i=0;i<w.length;i++){ r-=w[i]; if(r<=0) return i; } return w.length-1; };
+  const tasksByType = {
+    "New Build": ["Framing","Framing","Decking","Site Prep / Cleanup","Roofing"],
+    "Remodel": ["Demo","Drywall / Hang","Trim & Finish","Trim & Finish","Punch List"],
+    "Exterior": ["Decking","Framing","Site Prep / Cleanup"],
+    "Foundation": ["Foundation / Concrete","Foundation / Concrete","Site Prep / Cleanup"],
+  };
+  const entries = []; const today = new Date();
+  for (let d = 18; d >= 1; d--) {
+    const day = new Date(today); day.setDate(today.getDate()-d);
+    const dow = day.getDay(); if (dow===0||dow===6) continue;
+    employees.forEach((e, ei) => {
+      if (Math.random()<0.12) return;
+      const si = pick(prefs[ei]);
+      const start = new Date(day); start.setHours(7,[0,15,30][Math.floor(Math.random()*3)],0,0);
+      const end = new Date(start.getTime() + (6+Math.random()*3)*3600000);
+      const pool = tasksByType[sites[si].type] || ["Site Prep / Cleanup"];
+      entries.push({ id: uuid(), employeeId: e.id, siteId: sites[si].id, clockIn: start.toISOString(), clockOut: end.toISOString(), lat: null, lng: null, task: pool[Math.floor(Math.random()*pool.length)] });
+    });
+  }
+  const mkActive = (ei, si, h, lat, lng, task) => { const s = new Date(); s.setHours(s.getHours()-h,12,0,0); entries.push({ id: uuid(), employeeId: employees[ei].id, siteId: sites[si].id, clockIn: s.toISOString(), clockOut: null, lat, lng, task }); };
+  mkActive(0,0,3,42.9398,-73.8521,"Framing");
+  mkActive(1,1,2,43.0712,-73.7846,"Trim & Finish");
+  return { employees, sites, entries, tasks: [...DEFAULT_TASKS] };
+}
+
+/* ===================== helpers ===================== */
+const hoursOf = (e, now) => ((e.clockOut ? new Date(e.clockOut) : now) - new Date(e.clockIn)) / 3600000;
+const fmtH = (h) => `${Math.floor(h)}:${String(Math.round((h % 1) * 60)).padStart(2, "0")}`;
+const fmtDec = (h) => h.toFixed(1);
+const money = (n) => "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+const clockTime = (d) => d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+const startOfDay = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
+const endOfDay = (d) => { const x = new Date(d); x.setHours(23,59,59,999); return x; };
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
+const toInput = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const fromInput = (s) => { const [y,m,dd] = s.split("-").map(Number); return new Date(y,m-1,dd); };
+const fmtDay = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+const dayCount = (a, b) => Math.round((startOfDay(b)-startOfDay(a))/86400000)+1;
+const isoToLocalInput = (iso) => { const d = new Date(iso); const p = n => String(n).padStart(2,"0"); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+const localInputToISO = (s) => new Date(s).toISOString();
+const fmtStamp = (iso) => iso ? new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+const fmtDelta = (oldIso, newIso) => {
+  if (!oldIso || !newIso) return "";
+  const mins = Math.round((new Date(newIso) - new Date(oldIso)) / 60000);
+  if (mins === 0) return "";
+  const sign = mins > 0 ? "later" : "earlier"; const a = Math.abs(mins);
+  const h = Math.floor(a/60), m = a%60;
+  return `${h?h+"h ":""}${m?m+"m ":""}${sign}`;
+};
+const FIELD_LABEL = { clock_in: "Clock-in", clock_out: "Clock-out", task: "Task", site: "Job site" };
+const fmtAuditVal = (field, v) => (field === "clock_in" || field === "clock_out") ? fmtStamp(v) : (v == null || v === "" ? "—" : v);
+
+function buildStaffingRead({ matrix, types, taskRows, totalHours }) {
+  const sections = [];
+  const bf = matrix.filter(r => r.best && r.best[1] > 0).map(r => `${r.name} → ${r.best[0]} (${r.best[1].toFixed(1)}h logged)`);
+  sections.push({ head: "Best fit", lines: bf.length ? bf : ["No hours logged yet in this range."] });
+  const real = (taskRows||[]).filter(t => t.name !== "Unassigned");
+  const wt = real.slice(0,3).map(t => `${t.name} — ${t.hours.toFixed(1)}h (${totalHours ? (t.hours/totalHours*100).toFixed(0) : 0}% of hours)`);
+  sections.push({ head: "Where time went", lines: wt.length ? wt : ["No tasks tagged in this range."] });
+  const risks = [];
+  types.forEach(t => { const who = matrix.filter(r => r.cells[t] > 0).map(r => r.name); if (who.length === 1) risks.push(`${t} is only covered by ${who[0]} — single point of failure.`); });
+  sections.push({ head: "Risks", lines: risks.length ? risks : ["Coverage looks balanced — no single-person job types."] });
+  const moves = [];
+  const totals = matrix.map(r => ({ name: r.name, total: types.reduce((a,t)=>a+r.cells[t],0), cells: r.cells }));
+  types.forEach(t => { const who = matrix.filter(r => r.cells[t] > 0).map(r => r.name); if (who.length === 1) { const cand = totals.filter(e => e.cells[t]===0).sort((a,b)=>b.total-a.total)[0]; if (cand) moves.push(`Cross-train ${cand.name} on ${t} so ${who[0]} isn't the only option.`); } });
+  const sorted = totals.filter(e => e.total > 0).sort((a,b)=>b.total-a.total);
+  if (sorted.length >= 2) { const top = sorted[0], low = sorted[sorted.length-1]; if (top.total > low.total*1.6) moves.push(`${top.name} is carrying the most hours; ${low.name} has room to take on more.`); }
+  sections.push({ head: "Moves", lines: moves.length ? moves : ["Assignments look reasonable for this range."] });
+  return sections;
+}
+
+/* ===================== app ===================== */
+function App() {
+  const [data, setData] = useState(() => {
+    const c = cache.load();
+    if (c) { if (!c.tasks) c.tasks = [...DEFAULT_TASKS]; if (!c.edits) c.edits = []; return c; }
+    if (IS_CLOUD) return { employees: [], sites: [], tasks: [], entries: [], edits: [] };
+    const s = buildSeed(); s.edits = []; cache.save(s); return s;
+  });
+  const [tab, setTab] = useState("clock");
+  const [cardEmp, setCardEmp] = useState("");
+  const [now, setNow] = useState(new Date());
+  const [online, setOnline] = useState(navigator.onLine);
+  const [pending, setPending] = useState(outboxCount(loadOutbox()));
+  const [syncState, setSyncState] = useState(IS_CLOUD ? "loading" : "local"); // loading | ok | error | local
+  const [cloudPin, setCloudPin] = useState(null);
+  const [localPin, setLocalPin] = useState(() => localStorage.getItem("gangbox_local_pin") || "1234");
+  const [unlocked, setUnlocked] = useState(() => localStorage.getItem("gangbox_unlocked") === "1");
+
+  const dataRef = useRef(data);
+  const outbox = useRef(loadOutbox());
+  const flushing = useRef(false);
+
+  useEffect(() => { dataRef.current = data; cache.save(data); }, [data]);
+
+  /* live clock */
+  const hasActive = data.entries.some(e => !e.clockOut);
+  useEffect(() => { const id = setInterval(() => setNow(new Date()), hasActive ? 1000 : 30000); return () => clearInterval(id); }, [hasActive]);
+
+  /* ---- cloud: fetch, realtime, poll ---- */
+  const refresh = async () => {
+    if (!IS_CLOUD) return;
+    try {
+      const [e, s, t, en, st, ed] = await Promise.all([
+        client.from("employees").select("*").order("name"),
+        client.from("sites").select("*").order("created_at"),
+        client.from("tasks").select("*").order("created_at"),
+        client.from("entries").select("*").order("clock_in"),
+        client.from("settings").select("*").eq("id", 1).maybeSingle(),
+        client.from("edits").select("*").order("changed_at", { ascending: false }).limit(500),
+      ]);
+      if (e.error || s.error || t.error || en.error || ed.error) throw (e.error || s.error || t.error || en.error || ed.error);
+      setData(prev => ({
+        employees: (e.data || []).map(mapEmp),
+        sites: (s.data || []).map(mapSite),
+        tasks: (t.data || []).map(r => r.label),
+        entries: (en.data || []).map(mapEntry),
+        edits: (ed.data || []).map(mapEdit),
+      }));
+      if (st && st.data) setCloudPin(st.data.manager_pin || null);
+      setSyncState("ok");
+    } catch (err) { setSyncState("error"); }
+  };
+
+  const flush = async () => {
+    if (!IS_CLOUD || flushing.current) return;
+    const ob = outbox.current;
+    const eRows = Object.values(ob.entries), aRows = Object.values(ob.edits), dIds = ob.deletes;
+    if (!eRows.length && !aRows.length && !dIds.length) { setPending(0); return; }
+    if (!navigator.onLine) { setPending(outboxCount(ob)); return; }
+    flushing.current = true;
+    let ok = true;
+    if (eRows.length) { const { error } = await client.from("entries").upsert(eRows); if (error) ok = false; }
+    if (aRows.length) { const { error } = await client.from("edits").upsert(aRows); if (error) ok = false; }
+    if (dIds.length) { const { error } = await client.from("entries").delete().in("id", dIds); if (error) ok = false; }
+    flushing.current = false;
+    if (ok) { outbox.current = blankOutbox(); saveOutbox(outbox.current); setPending(0); }
+    else { setPending(outboxCount(outbox.current)); }
+  };
+
+  useEffect(() => {
+    if (!IS_CLOUD) return;
+    refresh().then(flush);
+    const ch = client.channel("gangbox-all")
+      .on("postgres_changes", { event: "*", schema: "public", table: "entries" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "employees" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "sites" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, refresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "edits" }, refresh)
+      .subscribe();
+    const poll = setInterval(refresh, 30000);
+    return () => { clearInterval(poll); client.removeChannel(ch); };
+  }, []);
+
+  useEffect(() => {
+    const goOn = () => { setOnline(true); flush(); };
+    const goOff = () => setOnline(false);
+    window.addEventListener("online", goOn);
+    window.addEventListener("offline", goOff);
+    const iv = setInterval(flush, 20000);
+    return () => { window.removeEventListener("online", goOn); window.removeEventListener("offline", goOff); clearInterval(iv); };
+  }, []);
+
+  const empById = (id) => data.employees.find(e => e.id === id);
+  const siteById = (id) => data.sites.find(s => s.id === id);
+  const bumpPending = () => setPending(outboxCount(outbox.current));
+  const enqueueEntry = (e) => { if (!IS_CLOUD) return; outbox.current.entries[e.id] = entryRow(e); saveOutbox(outbox.current); bumpPending(); flush(); };
+  const enqueueEdits = (rows) => { if (!IS_CLOUD) return; rows.forEach(r => { outbox.current.edits[r.id] = r; }); saveOutbox(outbox.current); bumpPending(); flush(); };
+  const enqueueDelete = (id) => { if (!IS_CLOUD) return; if (outbox.current.entries[id]) delete outbox.current.entries[id]; if (!outbox.current.deletes.includes(id)) outbox.current.deletes.push(id); saveOutbox(outbox.current); bumpPending(); flush(); };
+
+  /* ---- mutations (optimistic + cloud) ---- */
+  const clockIn = (employeeId, siteId, loc, task) => {
+    const e = { id: uuid(), employeeId, siteId, clockIn: new Date().toISOString(), clockOut: null, lat: loc?.lat ?? null, lng: loc?.lng ?? null, task: task || "" };
+    setData(d => ({ ...d, entries: [...d.entries, e] }));
+    enqueueEntry(e);
+  };
+  const clockOut = (id) => {
+    const cur = dataRef.current.entries.find(e => e.id === id); if (!cur) return;
+    const upd = { ...cur, clockOut: new Date().toISOString() };
+    setData(d => ({ ...d, entries: d.entries.map(e => e.id === id ? upd : e) }));
+    enqueueEntry(upd);
+  };
+  const setTask = (id, task) => {
+    const cur = dataRef.current.entries.find(e => e.id === id); if (!cur) return;
+    const upd = { ...cur, task };
+    setData(d => ({ ...d, entries: d.entries.map(e => e.id === id ? upd : e) }));
+    enqueueEntry(upd);
+  };
+
+  /* ---- audited time-card edits ---- */
+  const serialize = (f, v) => { if (v == null || v === "") return null; if (f === "site") { const s = siteById(v); return s ? s.name : String(v); } return String(v); };
+  const editEntryFields = (entryId, changes, note) => {
+    const cur = dataRef.current.entries.find(e => e.id === entryId); if (!cur) return;
+    const emp = empById(cur.employeeId);
+    const specs = [["clockIn", "clock_in"], ["clockOut", "clock_out"], ["task", "task"], ["siteId", "site"]];
+    const audits = []; const upd = { ...cur };
+    specs.forEach(([k, fld]) => {
+      if (k in changes && (changes[k] ?? null) !== (cur[k] ?? null)) {
+        audits.push(auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "edited", field: fld, oldValue: serialize(fld, cur[k]), newValue: serialize(fld, changes[k]), note }));
+        upd[k] = changes[k];
+      }
+    });
+    if (!audits.length) return;
+    setData(d => ({ ...d, entries: d.entries.map(e => e.id === entryId ? upd : e), edits: [...audits.map(mapEdit), ...(d.edits || [])] }));
+    enqueueEntry(upd);
+    enqueueEdits(audits);
+  };
+  const addMissedShift = (employeeId, siteId, clockInISO, clockOutISO, task) => {
+    const e = { id: uuid(), employeeId, siteId, clockIn: clockInISO, clockOut: clockOutISO || null, lat: null, lng: null, task: task || "" };
+    const emp = empById(employeeId);
+    const a = auditRow({ entryId: e.id, employeeId, employeeName: emp ? emp.name : null, action: "created", oldValue: null, newValue: `in ${fmtStamp(clockInISO)}${clockOutISO ? ` → out ${fmtStamp(clockOutISO)}` : " (open)"}`, note: "Missed shift added manually" });
+    setData(d => ({ ...d, entries: [...d.entries, e], edits: [mapEdit(a), ...(d.edits || [])] }));
+    enqueueEntry(e); enqueueEdits([a]);
+  };
+  const deleteEntry = (entryId, note) => {
+    const cur = dataRef.current.entries.find(e => e.id === entryId); if (!cur) return;
+    const emp = empById(cur.employeeId);
+    const a = auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "deleted", oldValue: `in ${fmtStamp(cur.clockIn)}${cur.clockOut ? ` → out ${fmtStamp(cur.clockOut)}` : " (open)"}`, newValue: null, note: note || "Time card deleted" });
+    setData(d => ({ ...d, entries: d.entries.filter(e => e.id !== entryId), edits: [mapEdit(a), ...(d.edits || [])] }));
+    enqueueDelete(entryId); enqueueEdits([a]);
+  };
+  const addTaskType = (label) => {
+    if (data.tasks.includes(label)) return;
+    setData(d => ({ ...d, tasks: [...d.tasks, label] }));
+    if (IS_CLOUD) client.from("tasks").insert({ id: uuid(), label }).then(({ error }) => { if (error && error.code !== "23505") alert("Couldn't save task: " + error.message); });
+  };
+  const addEmployee = (name, trade) => {
+    const e = { id: uuid(), name, trade };
+    setData(d => ({ ...d, employees: [...d.employees, e] }));
+    if (IS_CLOUD) client.from("employees").insert({ id: e.id, name, trade }).then(({ error }) => { if (error) alert("Couldn't save crew member: " + error.message); });
+  };
+  const addSite = (s) => {
+    const row = { id: uuid(), ...s };
+    setData(d => ({ ...d, sites: [...d.sites, row] }));
+    if (IS_CLOUD) client.from("sites").insert({ id: row.id, name: s.name, customer: s.customer, address: s.address, type: s.type, bill_rate: s.billRate }).then(({ error }) => { if (error) alert("Couldn't save job site: " + error.message); });
+  };
+  const changePin = (p) => {
+    if (IS_CLOUD) { setCloudPin(p); client.from("settings").upsert({ id: 1, manager_pin: p }).then(({ error }) => { if (error) alert("Couldn't update PIN: " + error.message); }); }
+    else { localStorage.setItem("gangbox_local_pin", p); setLocalPin(p); }
+  };
+  const resetLocal = () => { if (confirm("Reset all data back to the sample crew and jobs on this device?")) { const s = buildSeed(); setData(s); } };
+
+  const effectivePin = IS_CLOUD ? cloudPin : localPin;
+  const unlock = () => { setUnlocked(true); localStorage.setItem("gangbox_unlocked", "1"); };
+  const lock = () => { setUnlocked(false); localStorage.removeItem("gangbox_unlocked"); };
+
+  const managerTab = tab === "sites" || tab === "crew" || tab === "reports";
+  const needPin = managerTab && !unlocked;
+
+  return (
+    <div style={styles.page}>
+      <Header now={now} sync={IS_CLOUD ? (syncState === "error" ? "error" : (online ? "ok" : "offline")) : "local"} pending={pending} />
+      {syncState === "error" && IS_CLOUD && (
+        <div style={styles.errBanner}>Can't reach the database — showing last synced data. New punches will upload when it reconnects.</div>
+      )}
+      <main style={styles.main}>
+        {tab === "clock" && <ClockTab data={data} now={now} empById={empById} siteById={siteById} onClockIn={clockIn} onClockOut={clockOut} onSetTask={setTask} onAddTaskType={addTaskType} onOpenCard={(id) => { setCardEmp(id); setTab("cards"); }} />}
+        {tab === "cards" && <CardsTab data={data} now={now} empById={empById} siteById={siteById} initialEmp={cardEmp} onEdit={editEntryFields} onCreate={addMissedShift} onDelete={deleteEntry} />}
+        {needPin && <PinGate effectivePin={effectivePin} onUnlock={unlock} onCreate={(p) => { changePin(p); unlock(); }} />}
+        {!needPin && tab === "sites" && <SitesTab data={data} now={now} onAdd={addSite} />}
+        {!needPin && tab === "crew" && <CrewTab data={data} now={now} onAdd={addEmployee} />}
+        {!needPin && tab === "reports" && <ReportsTab data={data} now={now} empById={empById} siteById={siteById} isCloud={IS_CLOUD} onReset={resetLocal} onLock={lock} onChangePin={changePin} />}
+      </main>
+      <Nav tab={tab} setTab={setTab} />
+    </div>
+  );
+}
+
+/* ===================== header ===================== */
+function Header({ now, sync, pending }) {
+  const pill = {
+    ok: { t: "● Synced", c: T.active },
+    offline: { t: pending ? `● Offline · ${pending} to sync` : "● Offline", c: T.warn },
+    error: { t: "● No connection", c: T.warn },
+    local: { t: "● Local only", c: T.steelSoft },
+  }[sync];
+  return (
+    <header style={styles.header}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={styles.mark}><span style={{ color: T.amber }}>GANG</span><span style={{ color: T.ticket }}>BOX</span></div>
+          <div style={styles.markSub}>FIELD TIME · JOB-COSTED</div>
+        </div>
+        <div style={{ ...styles.syncPill, color: pill.c }}>{pill.t}</div>
+      </div>
+      <div style={styles.clockReadout}>
+        <span style={{ color: T.amber }}>●</span> {clockTime(now)}
+        <span style={{ color: T.steelSoft, marginLeft: 8, fontSize: 11 }}>{now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}</span>
+      </div>
+    </header>
+  );
+}
+
+/* ===================== pin gate ===================== */
+function PinGate({ effectivePin, onUnlock, onCreate }) {
+  const creating = effectivePin == null || effectivePin === "";
+  const [v, setV] = useState("");
+  const [err, setErr] = useState("");
+  const submit = () => {
+    if (creating) { if (v.trim().length < 4) { setErr("Use at least 4 digits."); return; } onCreate(v.trim()); }
+    else if (v === effectivePin) { onUnlock(); }
+    else { setErr("That PIN didn't match."); setV(""); }
+  };
+  return (
+    <div style={styles.pinWrap}>
+      <div style={styles.pinCard}>
+        <div style={styles.pinTitle}>{creating ? "SET A MANAGER PIN" : "MANAGER ACCESS"}</div>
+        <div style={styles.pinSub}>{creating ? "Pick a PIN. You'll use it to open Sites, Crew, and Reports." : "Enter the PIN to open management screens. The Clock screen stays open for the crew."}</div>
+        <input type="password" inputMode="numeric" autoFocus value={v} placeholder="••••"
+          onChange={(e) => { setV(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && submit()} style={styles.pinInput} />
+        {err && <div style={styles.pinErr}>{err}</div>}
+        <button style={styles.pinBtn} onClick={submit}>{creating ? "Save PIN" : "Unlock"}</button>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== clock ===================== */
+function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTask, onAddTaskType, onOpenCard }) {
+  const active = data.entries.filter(e => !e.clockOut);
+  const editedIds = new Set((data.edits || []).filter(x => x.action !== "deleted").map(x => x.entryId));
+  const [empId, setEmpId] = useState("");
+  const [siteId, setSiteId] = useState("");
+  const [task, setTask] = useState("");
+  const [locNote, setLocNote] = useState("");
+  const [mapFor, setMapFor] = useState(null);
+  const [taskFor, setTaskFor] = useState(null);
+  const myActive = empId ? active.find(e => e.employeeId === empId) : null;
+
+  const punchIn = () => {
+    if (!empId || !siteId) return;
+    setLocNote("Locating…");
+    const finish = (loc) => { onClockIn(empId, siteId, loc, task); setSiteId(""); setTask(""); setLocNote(loc ? "Location pin stamped on this punch." : "Punched in (location unavailable)."); setTimeout(() => setLocNote(""), 3500); };
+    if (navigator.geolocation) navigator.geolocation.getCurrentPosition((p) => finish({ lat: p.coords.latitude, lng: p.coords.longitude }), () => finish(null), { timeout: 7000 });
+    else finish(null);
+  };
+
+  const noCrew = data.employees.length === 0;
+  const noSites = data.sites.length === 0;
+
+  return (
+    <div>
+      <SectionLabel n="01">On site now</SectionLabel>
+      {active.length === 0 ? (
+        <Empty>{noCrew ? "No crew added yet. A manager can add the crew in the Crew tab." : "Nobody is punched in. Pick a name below to start the day."}</Empty>
+      ) : (
+        <div style={{ display: "grid", gap: 10, marginBottom: 26 }}>
+          {active.map((e) => {
+            const emp = empById(e.employeeId); const site = siteById(e.siteId);
+            const showMap = mapFor === e.id; const showTask = taskFor === e.id;
+            return (
+              <div key={e.id} style={styles.activeCardWrap}>
+                <div style={styles.activeCardTop}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}><span style={styles.liveDot} /><span style={styles.activeName}>{emp ? emp.name : "—"}</span>{emp && <span style={styles.tradePill}>{emp.trade}</span>}</div>
+                    <div style={styles.activeSite}>{site ? site.name : "—"}</div>
+                    <div style={styles.activeMeta}>in at {clockTime(new Date(e.clockIn))}</div>
+                    <div style={{ marginTop: 8, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>{e.task ? <span style={styles.taskBadge}>🔧 {e.task}</span> : <span style={styles.taskBadgeEmpty}>No task assigned</span>}{editedIds.has(e.id) && <span style={styles.editedBadge}>✎ edited</span>}</div>
+                  </div>
+                  <div style={{ textAlign: "right", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+                    <div style={styles.elapsed}>{fmtH(hoursOf(e, now))}</div>
+                    <button style={styles.outBtn} onClick={() => onClockOut(e.id)}>CLOCK OUT</button>
+                  </div>
+                </div>
+                <div style={styles.activeActions}>
+                  <button style={{ ...styles.lineBtn, ...(showTask ? styles.lineBtnOn : {}) }} onClick={() => { setTaskFor(showTask ? null : e.id); setMapFor(null); }}>{e.task ? "Change task" : "Assign task"}</button>
+                  <button style={{ ...styles.lineBtn, ...(showMap ? styles.lineBtnOn : {}) }} onClick={() => { setMapFor(showMap ? null : e.id); setTaskFor(null); }} disabled={!e.lat}>📍 {e.lat ? "Check-in pin" : "No location"}</button>
+                  <button style={styles.lineBtn} onClick={() => onOpenCard(e.employeeId)}>✎ Fix times</button>
+                </div>
+                {showTask && <div style={styles.expandRow}><TaskSelect tasks={data.tasks} value={e.task} onPick={(t) => { onSetTask(e.id, t); setTaskFor(null); }} onAddType={onAddTaskType} /></div>}
+                {showMap && e.lat && <div style={styles.expandRow}><LocationMap lat={e.lat} lng={e.lng} label={(emp ? emp.name.split(" ")[0] : "") + " " + clockTime(new Date(e.clockIn))} /></div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <SectionLabel n="02">Punch the clock</SectionLabel>
+      <div style={styles.punchPanel}>
+        {noCrew ? (
+          <div style={{ fontSize: 13.5, color: T.inkSoft }}>Once a manager adds the crew and job sites, this is where each person taps their name and clocks in.</div>
+        ) : (
+          <>
+            <FieldLabel>Crew member</FieldLabel>
+            <div style={styles.chipWrap}>
+              {data.employees.map((e) => { const on = active.find(a => a.employeeId === e.id); const sel = empId === e.id;
+                return <button key={e.id} onClick={() => setEmpId(sel ? "" : e.id)} style={{ ...styles.chip, ...(sel ? styles.chipSel : {}), ...(on && !sel ? styles.chipOn : {}) }}>{e.name.split(" ")[0]}{on ? " ●" : ""}</button>;
+              })}
+            </div>
+            {myActive ? (
+              <div style={styles.alreadyIn}>
+                <div>
+                  <div style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, letterSpacing: 0.5 }}>{(empById(myActive.employeeId) || {}).name?.split(" ")[0]?.toUpperCase()} IS ON THE CLOCK</div>
+                  <div style={{ color: T.inkSoft, fontSize: 13, marginTop: 2 }}>{(siteById(myActive.siteId) || {}).name} · {fmtH(hoursOf(myActive, now))} so far</div>
+                </div>
+                <button style={{ ...styles.outBtn, padding: "12px 18px" }} onClick={() => onClockOut(myActive.id)}>CLOCK OUT</button>
+              </div>
+            ) : (
+              <>
+                <FieldLabel>Job site</FieldLabel>
+                {noSites ? (
+                  <div style={{ ...styles.empty, marginBottom: 16 }}>No job sites yet. A manager can add them in the Sites tab.</div>
+                ) : (
+                  <div style={styles.siteList}>
+                    {data.sites.map((s) => { const sel = siteId === s.id;
+                      return <button key={s.id} onClick={() => setSiteId(sel ? "" : s.id)} style={{ ...styles.siteRow, ...(sel ? styles.siteRowSel : {}) }}>
+                        <div style={{ textAlign: "left" }}><div style={{ fontWeight: 600, fontSize: 14 }}>{s.name}</div><div style={{ fontSize: 12, color: T.inkSoft }}>{s.customer} · {s.address}</div></div>
+                        <span style={styles.typeBadge}>{s.type}</span></button>;
+                    })}
+                  </div>
+                )}
+                <FieldLabel>Task <span style={{ textTransform: "none", letterSpacing: 0, fontWeight: 400 }}>(optional — can be set later)</span></FieldLabel>
+                <TaskSelect tasks={data.tasks} value={task} onPick={setTask} onAddType={onAddTaskType} compact />
+                <button onClick={punchIn} disabled={!empId || !siteId} style={{ ...styles.bigPunch, ...(!empId || !siteId ? styles.bigPunchOff : {}), marginTop: 16 }}><span style={styles.bigPunchInner}>CLOCK IN</span></button>
+                {locNote && <div style={styles.locNote}>{locNote}</div>}
+                {(!empId || !siteId) && !noSites && <div style={styles.hint}>Pick a crew member and a job site to punch in.</div>}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TaskSelect({ tasks, value, onPick, onAddType, compact }) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const commit = () => { const t = draft.trim(); if (!t) return; onAddType(t); onPick(t); setDraft(""); setAdding(false); };
+  return (
+    <div style={{ width: "100%" }}>
+      <div style={styles.taskGrid}>
+        {tasks.map(t => <button key={t} onClick={() => onPick(value === t ? "" : t)} style={{ ...styles.taskChip, ...(value === t ? styles.taskChipSel : {}) }}>{t}</button>)}
+        <button style={styles.taskAdd} onClick={() => setAdding(a => !a)}>{adding ? "Cancel" : "+ New task type"}</button>
+      </div>
+      {adding && <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        <input autoFocus value={draft} placeholder="e.g. Tile / Backsplash" onChange={(ev) => setDraft(ev.target.value)} onKeyDown={(ev) => ev.key === "Enter" && commit()} style={styles.input} />
+        <button style={{ ...styles.aiBtn, padding: "10px 16px" }} onClick={commit}>Add</button>
+      </div>}
+      {!compact && value && <div style={{ fontSize: 12, color: T.active, marginTop: 8, fontWeight: 600 }}>Assigned: {value}</div>}
+    </div>
+  );
+}
+
+function LocationMap({ lat, lng, label }) {
+  const d = 0.004;
+  const bbox = `${(lng-d).toFixed(5)},${(lat-d).toFixed(5)},${(lng+d).toFixed(5)},${(lat+d).toFixed(5)}`;
+  const src = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat},${lng}`;
+  return (
+    <div>
+      <div style={styles.mapHead}><span>📍 Checked in here</span><span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: T.inkSoft }}>{lat.toFixed(5)}, {lng.toFixed(5)}</span></div>
+      <iframe title={`pin-${label}`} src={src} style={styles.mapFrame} loading="lazy" />
+      <a href={`https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=17/${lat}/${lng}`} target="_blank" rel="noreferrer" style={styles.mapLink}>Open full map ↗</a>
+    </div>
+  );
+}
+
+/* ===================== cards (edit time) ===================== */
+function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, onDelete }) {
+  const [empId, setEmpId] = useState(initialEmp || "");
+  const [editing, setEditing] = useState(null); // entry id, or "new", or null
+  const [histFor, setHistFor] = useState(null);
+  useEffect(() => { if (initialEmp) setEmpId(initialEmp); }, [initialEmp]);
+
+  const cutoff = addDays(now, -28).getTime();
+  const mine = data.entries
+    .filter(e => e.employeeId === empId && (!e.clockOut || new Date(e.clockIn).getTime() >= cutoff))
+    .sort((a, b) => (a.clockOut ? 1 : 0) - (b.clockOut ? 1 : 0) || new Date(b.clockIn) - new Date(a.clockIn));
+  const editsByEntry = {};
+  (data.edits || []).forEach(x => { if (x.entryId) (editsByEntry[x.entryId] = editsByEntry[x.entryId] || []).push(x); });
+
+  return (
+    <div>
+      <SectionLabel n="01">Fix a time card</SectionLabel>
+      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>Forgot to clock in or out? Pick your name, then fix the time. Every change is logged for the office.</div>
+      {data.employees.length === 0 ? <Empty>No crew yet. A manager adds the crew in the Crew tab.</Empty> : (
+        <div style={styles.chipWrap}>
+          {data.employees.map(e => <button key={e.id} onClick={() => { setEmpId(e.id); setEditing(null); }} style={{ ...styles.chip, ...(empId === e.id ? styles.chipSel : {}) }}>{e.name.split(" ")[0]}</button>)}
+        </div>
+      )}
+
+      {empId && (
+        <>
+          {editing === "new" ? (
+            <EntryEditor mode="new" entry={null} sites={data.sites} tasks={data.tasks}
+              onCancel={() => setEditing(null)}
+              onSave={(v) => { onCreate(empId, v.siteId, v.clockIn, v.clockOut, v.task); setEditing(null); }} />
+          ) : (
+            <button style={{ ...styles.aiBtn, width: "100%", marginBottom: 16 }} onClick={() => setEditing("new")}>+ Add a missed shift</button>
+          )}
+
+          {mine.length === 0 ? <Empty>No shifts in the last 4 weeks for {(empById(empId) || {}).name?.split(" ")[0]}.</Empty> : (
+            <div style={{ display: "grid", gap: 10 }}>
+              {mine.map(e => {
+                const site = siteById(e.siteId); const open = !e.clockOut;
+                const hist = editsByEntry[e.id] || [];
+                const isEd = editing === e.id;
+                return (
+                  <div key={e.id} style={styles.card}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+                          <span style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, fontWeight: 600 }}>{new Date(e.clockIn).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}</span>
+                          {open && <span style={styles.openPill}>ON THE CLOCK</span>}
+                          {hist.length > 0 && <span style={styles.editedBadge}>✎ edited</span>}
+                        </div>
+                        <div style={{ fontSize: 13, color: T.steel, fontWeight: 600, marginTop: 3 }}>{site ? site.name : "—"}{e.task ? ` · ${e.task}` : ""}</div>
+                        <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, color: T.ink, marginTop: 5 }}>
+                          {clockTime(new Date(e.clockIn))} <span style={{ color: T.steelSoft }}>→</span> {open ? <span style={{ color: T.active }}>now</span> : clockTime(new Date(e.clockOut))}
+                          <span style={{ color: T.inkSoft, marginLeft: 8 }}>({fmtDec(hoursOf(e, now))} h)</span>
+                        </div>
+                      </div>
+                    </div>
+                    {!isEd && (
+                      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                        <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => { setEditing(e.id); setHistFor(null); }}>Edit times</button>
+                        {hist.length > 0 && <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => setHistFor(histFor === e.id ? null : e.id)}>{histFor === e.id ? "Hide history" : `History (${hist.length})`}</button>}
+                      </div>
+                    )}
+                    {isEd && (
+                      <div style={{ marginTop: 12 }}>
+                        <EntryEditor mode="edit" entry={e} sites={data.sites} tasks={data.tasks}
+                          onCancel={() => setEditing(null)}
+                          onDelete={() => { if (confirm("Delete this time card? The deletion is logged for the office.")) { onDelete(e.id); setEditing(null); } }}
+                          onSave={(v) => { onEdit(e.id, { clockIn: v.clockIn, clockOut: v.clockOut, siteId: v.siteId, task: v.task }, "Edited on Cards screen"); setEditing(null); }} />
+                      </div>
+                    )}
+                    {histFor === e.id && !isEd && <EditHistory rows={hist} />}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function EntryEditor({ entry, sites, tasks, mode, onSave, onDelete, onCancel }) {
+  const base = entry || { clockIn: new Date().toISOString(), clockOut: null, siteId: (sites[0] || {}).id || "", task: "" };
+  const [inStr, setInStr] = useState(isoToLocalInput(base.clockIn));
+  const [stillOn, setStillOn] = useState(!base.clockOut);
+  const [outStr, setOutStr] = useState(isoToLocalInput(base.clockOut || new Date().toISOString()));
+  const [siteId, setSiteId] = useState(base.siteId || "");
+  const [task, setTask] = useState(base.task || "");
+  const [err, setErr] = useState("");
+  const save = () => {
+    const clockIn = localInputToISO(inStr);
+    const clockOut = stillOn ? null : localInputToISO(outStr);
+    if (!siteId) { setErr("Pick a job site."); return; }
+    if (clockOut && new Date(clockOut) <= new Date(clockIn)) { setErr("Clock-out must be after clock-in."); return; }
+    onSave({ clockIn, clockOut, siteId, task });
+  };
+  return (
+    <div style={styles.editorCard}>
+      <div style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 17, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 4 }}>{mode === "new" ? "Add a missed shift" : "Edit this time card"}</div>
+      <label style={{ display: "block" }}><div style={styles.fieldLabel}>Clock-in</div><input type="datetime-local" value={inStr} onChange={(e) => { setInStr(e.target.value); setErr(""); }} style={styles.input} /></label>
+      <div>
+        <div style={{ ...styles.fieldLabel, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>Clock-out</span>
+          <label style={{ textTransform: "none", letterSpacing: 0, fontWeight: 500, color: T.steel, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+            <input type="checkbox" checked={stillOn} onChange={(e) => { setStillOn(e.target.checked); setErr(""); }} />still on the clock
+          </label>
+        </div>
+        {!stillOn && <input type="datetime-local" value={outStr} onChange={(e) => { setOutStr(e.target.value); setErr(""); }} style={styles.input} />}
+      </div>
+      <label style={{ display: "block" }}><div style={styles.fieldLabel}>Job site</div>
+        <select value={siteId} onChange={(e) => setSiteId(e.target.value)} style={styles.input}>
+          <option value="">— pick a site —</option>
+          {sites.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+      </label>
+      <div><div style={styles.fieldLabel}>Task</div><TaskSelect tasks={tasks} value={task} onPick={setTask} onAddType={() => {}} compact /></div>
+      {err && <div style={{ color: T.warn, fontSize: 13, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", gap: 8 }}>
+        <button style={{ ...styles.aiBtn, flex: 1 }} onClick={save}>{mode === "new" ? "Add shift" : "Save changes"}</button>
+        <button style={styles.footBtn} onClick={onCancel}>Cancel</button>
+      </div>
+      {mode === "edit" && onDelete && <button style={{ ...styles.footBtn, color: T.warn, borderColor: "#E6C9AE" }} onClick={onDelete}>Delete this card</button>}
+    </div>
+  );
+}
+
+function EditHistory({ rows }) {
+  const ordered = [...rows].sort((a, b) => new Date(b.changedAt) - new Date(a.changedAt));
+  return (
+    <div style={styles.histBox}>
+      {ordered.map((x, i) => (
+        <div key={i} style={styles.histRow}>
+          <div style={{ fontSize: 12.5 }}>
+            {x.action === "created" && <span><b>Created.</b> {x.newValue}</span>}
+            {x.action === "deleted" && <span><b>Deleted.</b> was {x.oldValue}</span>}
+            {x.action === "edited" && <span><b>{FIELD_LABEL[x.field] || x.field}</b> {fmtAuditVal(x.field, x.oldValue)} <span style={{ color: T.steelSoft }}>→</span> {fmtAuditVal(x.field, x.newValue)} {(x.field === "clock_in" || x.field === "clock_out") && fmtDelta(x.oldValue, x.newValue) && <span style={{ color: T.warn }}>({fmtDelta(x.oldValue, x.newValue)})</span>}</span>}
+          </div>
+          <div style={{ fontSize: 11, color: T.steelSoft, fontFamily: "'JetBrains Mono',monospace", marginTop: 2 }}>{fmtStamp(x.changedAt)}{x.employeeName ? ` · ${x.employeeName}'s card` : ""}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ===================== sites ===================== */
+function SitesTab({ data, now, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const totals = {}; data.entries.forEach(e => { totals[e.siteId] = (totals[e.siteId] || 0) + hoursOf(e, now); });
+  return (
+    <div>
+      <SectionLabel n="01" action={<AddBtn open={open} onClick={() => setOpen(o => !o)} />}>Job sites</SectionLabel>
+      {open && <AddSiteForm onAdd={(s) => { onAdd(s); setOpen(false); }} />}
+      {data.sites.length === 0 && !open && <Empty>No job sites yet. Tap “+ Add” to create your first one.</Empty>}
+      <div style={{ display: "grid", gap: 10 }}>
+        {data.sites.map((s) => { const h = totals[s.id] || 0;
+          return <div key={s.id} style={styles.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+              <div style={{ minWidth: 0 }}><div style={styles.cardTitle}>{s.name}</div><div style={{ fontSize: 13, color: T.inkSoft, marginTop: 2 }}>{s.customer}</div><div style={{ fontSize: 12, color: T.steelSoft, marginTop: 1 }}>{s.address}</div></div>
+              <span style={styles.typeBadge}>{s.type}</span>
+            </div>
+            <div style={styles.cardStats}><Stat label="Logged" value={fmtDec(h) + " h"} /><Stat label="Bill rate" value={money(s.billRate) + "/h"} /><Stat label="Billable" value={money(h * s.billRate)} accent /></div>
+          </div>;
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===================== crew ===================== */
+function CrewTab({ data, now, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const totals = {}; data.entries.forEach(e => { totals[e.employeeId] = (totals[e.employeeId] || 0) + hoursOf(e, now); });
+  const active = new Set(data.entries.filter(e => !e.clockOut).map(e => e.employeeId));
+  return (
+    <div>
+      <SectionLabel n="01" action={<AddBtn open={open} onClick={() => setOpen(o => !o)} />}>Crew</SectionLabel>
+      {open && <AddCrewForm onAdd={(n, t) => { onAdd(n, t); setOpen(false); }} />}
+      {data.employees.length === 0 && !open && <Empty>No crew yet. Tap “+ Add” to add your first crew member.</Empty>}
+      <div style={{ display: "grid", gap: 10 }}>
+        {data.employees.map((e) => (
+          <div key={e.id} style={styles.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div><div style={{ display: "flex", alignItems: "center", gap: 8 }}>{active.has(e.id) && <span style={styles.liveDot} />}<span style={styles.cardTitle}>{e.name}</span></div><span style={{ ...styles.tradePill, marginTop: 6, display: "inline-block" }}>{e.trade}</span></div>
+              <div style={{ textAlign: "right" }}><div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 20, color: T.steel, fontWeight: 600 }}>{fmtDec(totals[e.id] || 0)}</div><div style={{ fontSize: 11, color: T.inkSoft, letterSpacing: 1 }}>HOURS · ALL TIME</div></div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ===================== reports ===================== */
+function ReportsTab({ data, now, empById, siteById, isCloud, onReset, onLock, onChangePin }) {
+  const [preset, setPreset] = useState("21d");
+  const [cStart, setCStart] = useState(toInput(addDays(now, -6)));
+  const [cEnd, setCEnd] = useState(toInput(now));
+  const [pinOpen, setPinOpen] = useState(false);
+  const [newPin, setNewPin] = useState("");
+
+  let from, to;
+  if (preset === "all") { from = new Date(2000, 0, 1); to = endOfDay(now); }
+  else if (preset === "custom") { from = startOfDay(fromInput(cStart)); to = endOfDay(fromInput(cEnd)); }
+  else { const days = { "7d": 7, "14d": 14, "21d": 21 }[preset] || 21; from = startOfDay(addDays(now, -(days - 1))); to = endOfDay(now); }
+  if (to < from) { const t = from; from = startOfDay(to); to = endOfDay(t); }
+
+  const inRange = data.entries.filter(e => { const t = new Date(e.clockIn).getTime(); return t >= from.getTime() && t <= to.getTime(); });
+  const rangeLabel = preset === "all" ? "All time" : `${fmtDay(from)} – ${fmtDay(to)} · ${dayCount(from, to)} days`;
+
+  const siteHours = {}; inRange.forEach(e => { siteHours[e.siteId] = (siteHours[e.siteId] || 0) + hoursOf(e, now); });
+  const billRows = data.sites.map(s => ({ name: s.name, hours: siteHours[s.id] || 0, bill: (siteHours[s.id] || 0) * s.billRate })).filter(r => r.hours > 0 || preset === "all").sort((a, b) => b.bill - a.bill);
+  const grand = billRows.reduce((a, r) => a + r.bill, 0);
+  const totalHours = billRows.reduce((a, r) => a + r.hours, 0);
+  const billMax = Math.max(1, ...billRows.map(r => r.bill));
+
+  const taskHours = {}; inRange.forEach(e => { const k = e.task || "Unassigned"; taskHours[k] = (taskHours[k] || 0) + hoursOf(e, now); });
+  const taskRows = Object.entries(taskHours).map(([name, hours]) => ({ name, hours })).sort((a, b) => b.hours - a.hours);
+  const taskMax = Math.max(1, ...taskRows.map(r => r.hours));
+
+  const crewRows = data.employees.map(e => { let h = 0; inRange.forEach(x => { if (x.employeeId === e.id) h += hoursOf(x, now); }); return { name: e.name.split(" ")[0], full: e.name, hours: h }; }).filter(r => r.hours > 0).sort((a, b) => b.hours - a.hours);
+  const crewMax = Math.max(1, ...crewRows.map(r => r.hours));
+
+  const types = TYPE_OPTIONS.filter(t => data.sites.some(s => s.type === t));
+  const matrix = data.employees.map(e => { const row = { name: e.name.split(" ")[0], trade: e.trade, cells: {} }; types.forEach(t => { let h = 0; inRange.forEach(x => { if (x.employeeId === e.id && (siteById(x.siteId) || {}).type === t) h += hoursOf(x, now); }); row.cells[t] = h; }); row.best = Object.entries(row.cells).sort((a, b) => b[1] - a[1])[0]; return row; });
+  const matrixMax = Math.max(1, ...matrix.flatMap(r => Object.values(r.cells)));
+  const empty = inRange.length === 0;
+  const auditRows = (data.edits || []).filter(x => { const t = new Date(x.changedAt).getTime(); return t >= from.getTime() && t <= to.getTime(); }).sort((a, b) => new Date(b.changedAt) - new Date(a.changedAt));
+  const readSections = empty ? [] : buildStaffingRead({ matrix, types, taskRows, totalHours });
+
+  return (
+    <div>
+      <div style={styles.rangeBar}>
+        <div style={styles.rangeChips}>
+          {[["7d", "1 week"], ["14d", "2 weeks"], ["21d", "3 weeks"], ["all", "All"], ["custom", "Custom"]].map(([id, label]) => <button key={id} onClick={() => setPreset(id)} style={{ ...styles.rangeChip, ...(preset === id ? styles.rangeChipSel : {}) }}>{label}</button>)}
+        </div>
+        {preset === "custom" && (
+          <div style={styles.customRange}>
+            <label style={styles.dateField}><span style={styles.dateLbl}>From</span><input type="date" value={cStart} max={cEnd} onChange={(e) => setCStart(e.target.value)} style={styles.dateInput} /></label>
+            <span style={{ color: T.steelSoft, paddingTop: 18 }}>→</span>
+            <label style={styles.dateField}><span style={styles.dateLbl}>To</span><input type="date" value={cEnd} min={cStart} max={toInput(now)} onChange={(e) => setCEnd(e.target.value)} style={styles.dateInput} /></label>
+          </div>
+        )}
+        <div style={styles.rangeReadout}><span style={styles.liveDot} /> {rangeLabel} · {inRange.length} punches</div>
+      </div>
+
+      {empty ? <Empty>No punches in this date range. Pick a wider window above.</Empty> : (
+        <>
+          <SectionLabel n="01">Billing by job site</SectionLabel>
+          <div style={styles.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}><Stat label="Total hours" value={fmtDec(totalHours)} /><Stat label="Billable in range" value={money(grand)} accent big /></div>
+            {billRows.map((r, i) => (
+              <div key={i} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}><span style={{ fontWeight: 600 }}>{r.name}</span><span style={{ fontFamily: "'JetBrains Mono',monospace", color: T.inkSoft }}>{fmtDec(r.hours)}h<span style={{ color: T.steel, marginLeft: 10, fontWeight: 600 }}>{money(r.bill)}</span></span></div>
+                <div style={styles.barTrack}><div style={{ ...styles.barFill, width: (r.bill / billMax * 100) + "%", background: i % 2 ? T.steel : T.amber }} /></div>
+              </div>
+            ))}
+          </div>
+
+          <SectionLabel n="02">Hours by task</SectionLabel>
+          <div style={styles.card}>
+            {taskRows.map((r, i) => { const isUn = r.name === "Unassigned"; const share = totalHours > 0 ? (r.hours / totalHours * 100) : 0;
+              return <div key={i} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}><span style={{ fontWeight: 600, color: isUn ? T.inkSoft : T.ink, fontStyle: isUn ? "italic" : "normal" }}>{isUn ? "" : "🔧 "}{r.name}</span><span style={{ fontFamily: "'JetBrains Mono',monospace", color: T.inkSoft }}>{fmtDec(r.hours)} h <span style={{ color: T.steelSoft }}>· {share.toFixed(0)}%</span></span></div>
+                <div style={styles.barTrack}><div style={{ ...styles.barFill, width: (r.hours / taskMax * 100) + "%", background: isUn ? T.steelSoft : T.amberDeep }} /></div>
+              </div>;
+            })}
+          </div>
+
+          <SectionLabel n="03">Hours by crew</SectionLabel>
+          <div style={styles.card}>
+            {crewRows.map((r, i) => (
+              <div key={i} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}><span style={{ fontWeight: 600 }}>{r.full}</span><span style={{ fontFamily: "'JetBrains Mono',monospace", color: T.inkSoft }}>{fmtDec(r.hours)} h</span></div>
+                <div style={styles.barTrack}><div style={{ ...styles.barFill, width: (r.hours / crewMax * 100) + "%" }} /></div>
+              </div>
+            ))}
+          </div>
+
+          <SectionLabel n="04">Who fits which work</SectionLabel>
+          <div style={{ ...styles.card, overflowX: "auto" }}>
+            <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 12 }}>Hours logged by each person against each type of job in this range. Darker = more time.</div>
+            <table style={styles.matrix}>
+              <thead><tr><th style={{ ...styles.mHead, textAlign: "left" }}></th>{types.map(t => <th key={t} style={styles.mHead}>{t}</th>)}</tr></thead>
+              <tbody>
+                {matrix.map((r, i) => (
+                  <tr key={i}>
+                    <td style={styles.mName}><div style={{ fontWeight: 600 }}>{r.name}</div><div style={{ fontSize: 10, color: T.steelSoft }}>{r.trade}</div></td>
+                    {types.map(t => { const v = r.cells[t]; const intensity = v / matrixMax; const isBest = r.best && r.best[0] === t && v > 0;
+                      return <td key={t} style={{ ...styles.mCell, background: v > 0 ? `rgba(51,72,90,${0.1 + intensity * 0.8})` : "transparent", color: intensity > 0.55 ? T.ticket : T.ink, outline: isBest ? `2px solid ${T.amber}` : "none", outlineOffset: -2 }}>{v > 0 ? fmtDec(v) : "·"}</td>;
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 12, fontSize: 11, color: T.inkSoft }}><span style={{ width: 12, height: 12, border: `2px solid ${T.amber}`, borderRadius: 2, display: "inline-block" }} />best-fit job type for each person</div>
+          </div>
+
+          <SectionLabel n="05">Staffing read</SectionLabel>
+          <div style={styles.card}>
+            <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 12 }}>Auto-generated from the time data for {rangeLabel}.</div>
+            {readSections.map((s, i) => (
+              <div key={i} style={{ marginBottom: 14 }}>
+                <div style={styles.readHead}>{s.head}</div>
+                {s.lines.map((l, j) => <div key={j} style={styles.readLine}><span style={{ color: T.amber, marginRight: 7 }}>▪</span>{l}</div>)}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* audit log — always visible to managers */}
+      <SectionLabel n="06">Time card changes</SectionLabel>
+      <div style={styles.card}>
+        <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: auditRows.length ? 12 : 0 }}>Edits, additions, and deletions made during {rangeLabel}. The original values are preserved here.</div>
+        {auditRows.length === 0 ? <div style={{ fontSize: 13, color: T.inkSoft }}>No time-card changes in this range.</div> : auditRows.slice(0, 80).map((x, i) => {
+          const tagColor = { created: T.active, edited: T.steel, deleted: T.warn }[x.action] || T.steel;
+          return (
+            <div key={i} style={styles.auditRow}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                <span style={{ fontWeight: 600, fontSize: 13 }}>{x.employeeName || "—"}</span>
+                <span style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 11, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.ticket, background: tagColor, padding: "2px 8px", borderRadius: 4 }}>{x.action}</span>
+              </div>
+              <div style={{ fontSize: 12.5, marginTop: 4 }}>
+                {x.action === "edited" && <span><b>{FIELD_LABEL[x.field] || x.field}</b>: {fmtAuditVal(x.field, x.oldValue)} <span style={{ color: T.steelSoft }}>→</span> {fmtAuditVal(x.field, x.newValue)} {(x.field === "clock_in" || x.field === "clock_out") && fmtDelta(x.oldValue, x.newValue) && <span style={{ color: T.warn, fontWeight: 600 }}>({fmtDelta(x.oldValue, x.newValue)})</span>}</span>}
+                {x.action === "created" && <span>Added manually — {x.newValue}</span>}
+                {x.action === "deleted" && <span>Deleted — was {x.oldValue}</span>}
+              </div>
+              <div style={{ fontSize: 11, color: T.steelSoft, fontFamily: "'JetBrains Mono',monospace", marginTop: 3 }}>{fmtStamp(x.changedAt)}{x.note ? ` · ${x.note}` : ""}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* manager footer */}
+      <div style={styles.managerFooter}>
+        <button style={styles.footBtn} onClick={() => setPinOpen(o => !o)}>Change PIN</button>
+        <button style={styles.footBtn} onClick={onLock}>🔒 Lock manager view</button>
+        {!isCloud && <button style={styles.footBtn} onClick={onReset}>Reset demo data</button>}
+      </div>
+      {pinOpen && (
+        <div style={{ ...styles.formCard, marginTop: 12 }}>
+          <FieldLabel>New manager PIN</FieldLabel>
+          <input type="password" inputMode="numeric" value={newPin} placeholder="at least 4 digits" onChange={(e) => setNewPin(e.target.value)} style={styles.input} />
+          <button style={styles.aiBtn} disabled={newPin.trim().length < 4} onClick={() => { onChangePin(newPin.trim()); setNewPin(""); setPinOpen(false); }}>Save new PIN</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== shared ===================== */
+function SectionLabel({ n, children, action }) { return <div style={styles.sectionLabel}><div style={{ display: "flex", alignItems: "baseline", gap: 10 }}><span style={styles.sectionNum}>{n}</span><span style={styles.sectionText}>{children}</span></div>{action}</div>; }
+function FieldLabel({ children }) { return <div style={styles.fieldLabel}>{children}</div>; }
+function Stat({ label, value, accent, big }) { return <div><div style={{ fontSize: 10, letterSpacing: 1, color: T.inkSoft, textTransform: "uppercase" }}>{label}</div><div style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 600, fontSize: big ? 24 : 17, color: accent ? T.steel : T.ink, marginTop: 2 }}>{value}</div></div>; }
+function Empty({ children }) { return <div style={styles.empty}>{children}</div>; }
+function AddBtn({ open, onClick }) { return <button style={styles.addBtn} onClick={onClick}>{open ? "Close" : "+ Add"}</button>; }
+function AddSiteForm({ onAdd }) {
+  const [f, setF] = useState({ name: "", customer: "", address: "", type: "New Build", billRate: "85" });
+  const ok = f.name && f.customer;
+  return <div style={styles.formCard}>
+    <Input label="Project name" value={f.name} onChange={(v) => setF({ ...f, name: v })} />
+    <Input label="Customer" value={f.customer} onChange={(v) => setF({ ...f, customer: v })} />
+    <Input label="Address" value={f.address} onChange={(v) => setF({ ...f, address: v })} />
+    <div style={{ display: "flex", gap: 10 }}><Select label="Work type" value={f.type} options={TYPE_OPTIONS} onChange={(v) => setF({ ...f, type: v })} /><Input label="Bill $/h" value={f.billRate} onChange={(v) => setF({ ...f, billRate: v.replace(/[^0-9]/g, "") })} /></div>
+    <button style={{ ...styles.aiBtn, opacity: ok ? 1 : 0.4 }} disabled={!ok} onClick={() => onAdd({ ...f, billRate: Number(f.billRate) || 0 })}>Save job site</button>
+  </div>;
+}
+function AddCrewForm({ onAdd }) {
+  const [name, setName] = useState(""); const [trade, setTrade] = useState("Carpenter");
+  return <div style={styles.formCard}><Input label="Name" value={name} onChange={setName} /><Select label="Trade" value={trade} options={TRADE_OPTIONS} onChange={setTrade} /><button style={{ ...styles.aiBtn, opacity: name ? 1 : 0.4 }} disabled={!name} onClick={() => onAdd(name, trade)}>Add to crew</button></div>;
+}
+function Input({ label, value, onChange }) { return <label style={{ display: "block", flex: 1 }}><div style={styles.fieldLabel}>{label}</div><input value={value} onChange={(e) => onChange(e.target.value)} style={styles.input} /></label>; }
+function Select({ label, value, options, onChange }) { return <label style={{ display: "block", flex: 1 }}><div style={styles.fieldLabel}>{label}</div><select value={value} onChange={(e) => onChange(e.target.value)} style={styles.input}>{options.map(o => <option key={o} value={o}>{o}</option>)}</select></label>; }
+function Nav({ tab, setTab }) {
+  const items = [["clock", "Clock", "⏱"], ["cards", "Cards", "✎"], ["sites", "Sites", "▣"], ["crew", "Crew", "◑"], ["reports", "Reports", "▤"]];
+  return <nav style={styles.nav}>{items.map(([id, label, icon]) => <button key={id} onClick={() => setTab(id)} style={{ ...styles.navBtn, ...(tab === id ? styles.navBtnActive : {}) }}><span style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span><span style={{ fontSize: 11, letterSpacing: 0.5 }}>{label}</span></button>)}</nav>;
+}
+
+/* ===================== styles ===================== */
+const styles = {
+  page: { background: T.concrete, color: T.ink, minHeight: "100vh", display: "flex", flexDirection: "column", maxWidth: 560, margin: "0 auto", position: "relative" },
+  header: { background: T.ink, padding: "calc(12px + env(safe-area-inset-top)) 18px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `3px solid ${T.amber}`, position: "sticky", top: 0, zIndex: 20 },
+  mark: { fontFamily: "'Barlow Condensed',sans-serif", fontWeight: 700, fontSize: 24, letterSpacing: 1, lineHeight: 1 },
+  markSub: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 10, letterSpacing: 2, color: T.steelSoft, alignSelf: "flex-end", paddingBottom: 2 },
+  syncPill: { fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, fontWeight: 600, letterSpacing: 0.3 },
+  clockReadout: { fontFamily: "'JetBrains Mono',monospace", color: T.ticket, fontSize: 14, fontWeight: 600, textAlign: "right" },
+  errBanner: { background: "#F6E3D2", color: T.warn, fontSize: 12.5, fontWeight: 600, padding: "8px 16px", textAlign: "center", borderBottom: `1px solid #E6C9AE` },
+  main: { flex: 1, padding: "20px 16px calc(100px + env(safe-area-inset-bottom))", overflowY: "auto" },
+
+  pinWrap: { display: "flex", justifyContent: "center", paddingTop: 24 },
+  pinCard: { background: T.ticket, border: `1px solid ${T.line}`, borderRadius: 14, padding: 24, width: "100%", maxWidth: 340, textAlign: "center" },
+  pinTitle: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 24, fontWeight: 700, letterSpacing: 1, color: T.ink },
+  pinSub: { fontSize: 13, color: T.inkSoft, margin: "8px 0 18px", lineHeight: 1.5 },
+  pinInput: { width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 24, fontFamily: "'JetBrains Mono',monospace", padding: "12px 0", borderRadius: 10, border: `1.5px solid ${T.line}`, background: "#fff", color: T.ink },
+  pinErr: { color: T.warn, fontSize: 13, marginTop: 10, fontWeight: 600 },
+  pinBtn: { marginTop: 16, width: "100%", background: T.ink, color: T.ticket, border: "none", borderRadius: 10, padding: "13px 0", fontFamily: "'Barlow Condensed',sans-serif", fontWeight: 600, fontSize: 18, letterSpacing: 1 },
+
+  sectionLabel: { display: "flex", alignItems: "center", justifyContent: "space-between", margin: "26px 0 12px" },
+  sectionNum: { fontFamily: "'JetBrains Mono',monospace", color: T.amberDeep, fontSize: 12, fontWeight: 600 },
+  sectionText: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 22, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.ink },
+
+  rangeBar: { background: T.ink, borderRadius: 12, padding: 14, marginBottom: 8 },
+  rangeChips: { display: "flex", flexWrap: "wrap", gap: 7 },
+  rangeChip: { padding: "8px 13px", borderRadius: 20, border: `1.5px solid ${T.steel}`, background: "transparent", color: "#C9D2D8", fontSize: 13, fontWeight: 600 },
+  rangeChipSel: { background: T.amber, borderColor: T.amber, color: T.ink },
+  customRange: { display: "flex", alignItems: "flex-end", gap: 10, marginTop: 12 },
+  dateField: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },
+  dateLbl: { fontSize: 10, letterSpacing: 1, textTransform: "uppercase", color: T.steelSoft, fontWeight: 600 },
+  dateInput: { padding: "9px 10px", borderRadius: 7, border: `1px solid ${T.steel}`, background: T.ticket, color: T.ink, fontSize: 13, fontFamily: "'JetBrains Mono',monospace", width: "100%" },
+  rangeReadout: { display: "flex", alignItems: "center", gap: 8, marginTop: 12, color: "#C9D2D8", fontSize: 12.5, fontFamily: "'JetBrains Mono',monospace" },
+
+  card: { background: T.ticket, border: `1px solid ${T.line}`, borderRadius: 10, padding: 16, boxShadow: "0 1px 0 rgba(0,0,0,0.03)" },
+  cardTitle: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 19, fontWeight: 600, letterSpacing: 0.3 },
+  cardStats: { display: "flex", justifyContent: "space-between", marginTop: 14, paddingTop: 12, borderTop: `1px solid ${T.line}` },
+
+  activeCardWrap: { background: T.ticket, border: `1px solid ${T.line}`, borderLeft: `4px solid ${T.active}`, borderRadius: 10, overflow: "hidden" },
+  activeCardTop: { display: "flex", gap: 12, alignItems: "flex-start", padding: 14 },
+  activeActions: { display: "flex", gap: 8, padding: "0 14px 12px" },
+  lineBtn: { flex: 1, background: "#F1F0EC", color: T.steel, border: `1px solid ${T.line}`, borderRadius: 7, padding: "9px 8px", fontSize: 12.5, fontWeight: 600 },
+  lineBtnOn: { background: T.steel, color: T.ticket, borderColor: T.steel },
+  expandRow: { padding: "0 14px 14px" },
+  liveDot: { width: 9, height: 9, borderRadius: "50%", background: T.active, boxShadow: `0 0 0 3px ${T.activeSoft}`, display: "inline-block", flexShrink: 0 },
+  activeName: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 19, fontWeight: 600 },
+  activeSite: { fontSize: 13, color: T.steel, fontWeight: 600, marginTop: 4 },
+  activeMeta: { fontSize: 11, color: T.inkSoft, marginTop: 2 },
+  elapsed: { fontFamily: "'JetBrains Mono',monospace", fontSize: 22, fontWeight: 600, color: T.active },
+  tradePill: { fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase", color: T.steel, background: "#E7ECEF", padding: "2px 7px", borderRadius: 20, fontWeight: 600 },
+
+  taskBadge: { display: "inline-block", fontSize: 12.5, fontWeight: 600, color: T.amberDeep, background: "#FBEFD6", border: `1px solid #EAD3A0`, padding: "3px 10px", borderRadius: 20 },
+  taskBadgeEmpty: { display: "inline-block", fontSize: 12, color: T.inkSoft, fontStyle: "italic" },
+  editedBadge: { display: "inline-block", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: T.warn, background: "#F6E3D2", padding: "2px 8px", borderRadius: 20, textTransform: "uppercase" },
+  openPill: { display: "inline-block", fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: T.ticket, background: T.active, padding: "2px 8px", borderRadius: 20 },
+  editorCard: { background: "#F6F8F9", border: `1px solid ${T.line}`, borderRadius: 10, padding: 14, display: "grid", gap: 12 },
+  histBox: { marginTop: 12, borderTop: `1px solid ${T.line}`, paddingTop: 10, display: "grid", gap: 10 },
+  histRow: { borderLeft: `2px solid ${T.line}`, paddingLeft: 10 },
+  auditRow: { padding: "10px 0", borderBottom: `1px solid ${T.line}` },
+  taskGrid: { display: "flex", flexWrap: "wrap", gap: 7 },
+  taskChip: { padding: "8px 12px", borderRadius: 7, border: `1.5px solid ${T.line}`, background: T.ticket, color: T.ink, fontSize: 13, fontWeight: 500 },
+  taskChipSel: { background: T.amber, borderColor: T.amberDeep, color: T.ink, fontWeight: 600 },
+  taskAdd: { padding: "8px 12px", borderRadius: 7, border: `1.5px dashed ${T.steelSoft}`, background: "transparent", color: T.steel, fontSize: 13, fontWeight: 600 },
+
+  mapHead: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5, fontWeight: 600, color: T.steel, marginBottom: 6 },
+  mapFrame: { width: "100%", height: 170, border: `1px solid ${T.line}`, borderRadius: 8, display: "block", background: "#dfe7ea" },
+  mapLink: { display: "inline-block", marginTop: 6, fontSize: 12, color: T.steel, fontWeight: 600, textDecoration: "none" },
+
+  punchPanel: { background: T.ticket, border: `1px solid ${T.line}`, borderRadius: 12, padding: 16 },
+  fieldLabel: { fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase", color: T.inkSoft, fontWeight: 600, margin: "4px 0 8px" },
+  chipWrap: { display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 18 },
+  chip: { padding: "9px 14px", borderRadius: 24, border: `1.5px solid ${T.line}`, background: T.ticket, color: T.ink, fontSize: 14, fontWeight: 500 },
+  chipSel: { background: T.ink, color: T.ticket, borderColor: T.ink },
+  chipOn: { borderColor: T.active, color: T.active },
+
+  siteList: { display: "grid", gap: 8, marginBottom: 18 },
+  siteRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "12px 14px", borderRadius: 8, border: `1.5px solid ${T.line}`, background: T.ticket },
+  siteRowSel: { borderColor: T.steel, background: "#F1F5F7" },
+  typeBadge: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 12, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.ticket, background: T.steel, padding: "3px 9px", borderRadius: 4, whiteSpace: "nowrap", flexShrink: 0 },
+
+  bigPunch: { width: "100%", border: "none", borderRadius: 10, padding: 5, background: HAZARD },
+  bigPunchInner: { display: "block", background: T.amber, color: T.ink, fontFamily: "'Barlow Condensed',sans-serif", fontWeight: 700, fontSize: 28, letterSpacing: 3, padding: "16px 0", borderRadius: 6 },
+  bigPunchOff: { filter: "grayscale(0.7) opacity(0.5)" },
+  hint: { textAlign: "center", fontSize: 12, color: T.inkSoft, marginTop: 10 },
+  locNote: { textAlign: "center", fontSize: 12, color: T.active, marginTop: 10, fontWeight: 600 },
+
+  alreadyIn: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, background: T.activeSoft, border: `1px solid ${T.active}`, borderRadius: 10, padding: 14 },
+  outBtn: { background: T.ink, color: T.ticket, border: "none", borderRadius: 6, padding: "9px 14px", fontFamily: "'Barlow Condensed',sans-serif", fontWeight: 600, fontSize: 14, letterSpacing: 1 },
+  empty: { background: T.ticket, border: `1px dashed ${T.line}`, borderRadius: 10, padding: 22, textAlign: "center", color: T.inkSoft, fontSize: 14, marginBottom: 26 },
+
+  barTrack: { height: 9, background: "#ECEAE4", borderRadius: 5, overflow: "hidden" },
+  barFill: { height: "100%", background: T.steel, borderRadius: 5 },
+
+  matrix: { borderCollapse: "collapse", width: "100%", minWidth: 360 },
+  mHead: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 12, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.inkSoft, padding: "0 4px 8px", textAlign: "center", whiteSpace: "nowrap" },
+  mName: { fontSize: 13, padding: "5px 10px 5px 0", whiteSpace: "nowrap" },
+  mCell: { fontFamily: "'JetBrains Mono',monospace", fontSize: 12, textAlign: "center", padding: "10px 4px", borderRadius: 4, minWidth: 52, fontWeight: 600 },
+
+  readHead: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 16, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase", color: T.steel, marginBottom: 6 },
+  readLine: { fontSize: 13.5, lineHeight: 1.5, color: T.ink, display: "flex", marginBottom: 3 },
+
+  aiBtn: { background: T.steel, color: T.ticket, border: "none", borderRadius: 8, padding: "12px 18px", fontWeight: 600, fontSize: 14 },
+  managerFooter: { display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginTop: 28 },
+  footBtn: { background: "transparent", color: T.inkSoft, border: `1px solid ${T.line}`, borderRadius: 20, padding: "8px 16px", fontSize: 12.5, fontWeight: 600 },
+  addBtn: { background: T.ink, color: T.ticket, border: "none", borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 600 },
+  formCard: { background: T.ticket, border: `1px solid ${T.line}`, borderRadius: 10, padding: 16, marginBottom: 14, display: "grid", gap: 12 },
+  input: { width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${T.line}`, fontSize: 14, background: "#fff", color: T.ink },
+
+  nav: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 560, background: T.ink, display: "flex", borderTop: `2px solid ${T.amber}`, zIndex: 20, paddingBottom: "env(safe-area-inset-bottom)" },
+  navBtn: { flex: 1, background: "none", border: "none", color: T.steelSoft, padding: "10px 0 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, fontFamily: "'Barlow Condensed',sans-serif", textTransform: "uppercase", fontWeight: 600 },
+  navBtnActive: { color: T.amber },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => { navigator.serviceWorker.register("./service-worker.js").catch(() => {}); });
+  }
+</script>
+</body>
+</html>
