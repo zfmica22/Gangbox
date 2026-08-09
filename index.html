@@ -379,7 +379,11 @@ function App() {
     try { return JSON.parse(localStorage.getItem("gangbox_emp_pins") || "{}")[eid] === p; } catch { return false; }
   };
   const setEmpPin = async (eid, p) => {
-    if (IS_CLOUD) { const { error } = await client.from("employee_pins").upsert({ employee_id: eid, pin: p }); return !error; }
+    if (IS_CLOUD) {
+      const { data, error } = await client.rpc("set_employee_pin", { eid, p });
+      if (error) { console.error("set_employee_pin failed:", error); showToast("Couldn't save PIN: " + (error.message || "unknown error"), "err"); return false; }
+      return !!data;
+    }
     try { const m = JSON.parse(localStorage.getItem("gangbox_emp_pins") || "{}"); m[eid] = p; localStorage.setItem("gangbox_emp_pins", JSON.stringify(m)); return true; } catch { return false; }
   };
   const signIn = (eid) => { setWorker(eid); localStorage.setItem("gangbox_worker", eid); const e = empById(eid); showToast(`Signed in as ${e ? e.name.split(" ")[0] : "you"}`, "ok"); };
@@ -495,7 +499,7 @@ function SignIn({ data, empById, empPinSet, verifyEmpPin, setEmpPin, onSignIn, e
     if (pin.trim().length < 4) { setErr("Use at least 4 digits."); return; }
     if (pin !== pin2) { setErr("PINs don't match."); return; }
     const ok = await setEmpPin(empId, pin.trim());
-    if (ok) onSignIn(empId); else setErr("Couldn't save PIN — check your connection and try again.");
+    if (ok) onSignIn(empId); else setErr("Couldn't save PIN. See the message at the top of the screen for the reason.");
   };
 
   if (state === "pick" || state === "checking") {
