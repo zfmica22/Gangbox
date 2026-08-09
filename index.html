@@ -694,6 +694,7 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
   const [empId, setEmpId] = useState(manager ? (initialEmp || "") : (worker || ""));
   const [editing, setEditing] = useState(null);
   const [histFor, setHistFor] = useState(null);
+  const [mapFor, setMapFor] = useState(null);
   useEffect(() => { if (manager && initialEmp) setEmpId(initialEmp); if (!manager) setEmpId(worker || ""); }, [initialEmp, manager, worker]);
 
   if (!manager && !(worker && empById(worker))) {
@@ -751,8 +752,16 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
                     </div>
                     {!isEd && (
                       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                        <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => { setEditing(e.id); setHistFor(null); }}>Edit times</button>
-                        {hist.length > 0 && <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => setHistFor(histFor === e.id ? null : e.id)}>{histFor === e.id ? "Hide history" : `History (${hist.length})`}</button>}
+                        <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => { setEditing(e.id); setHistFor(null); setMapFor(null); }}>Edit times</button>
+                        {hist.length > 0 && <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px" }} onClick={() => { setHistFor(histFor === e.id ? null : e.id); setMapFor(null); }}>{histFor === e.id ? "Hide history" : `History (${hist.length})`}</button>}
+                        {e.lat ? <button style={{ ...styles.lineBtn, flex: "none", padding: "9px 16px", ...(mapFor === e.id ? styles.lineBtnOn : {}) }} onClick={() => { setMapFor(mapFor === e.id ? null : e.id); setHistFor(null); }}>📍 {mapFor === e.id ? "Hide pin" : "Check-in pin"}</button>
+                          : <span style={styles.noPinNote}>📍 No location on this punch</span>}
+                      </div>
+                    )}
+                    {mapFor === e.id && !isEd && e.lat && (
+                      <div style={{ marginTop: 12 }}>
+                        <LocationMap lat={e.lat} lng={e.lng} label={`${(empById(e.employeeId) || {}).name?.split(" ")[0] || ""} · in at ${clockTime(new Date(e.clockIn))}`} />
+                        <div style={styles.pinMeta}>Stamped when {(empById(e.employeeId) || {}).name?.split(" ")[0] || "they"} clocked in on {new Date(e.clockIn).toLocaleDateString("en-US", { month: "short", day: "numeric" })} at {clockTime(new Date(e.clockIn))}. Clock-outs aren’t location-stamped.</div>
                       </div>
                     )}
                     {isEd && (
@@ -1111,6 +1120,8 @@ const styles = {
   tradeX: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 18, height: 18, borderRadius: "50%", background: "#D7DEE2", color: T.steel, fontSize: 14, lineHeight: 1, cursor: "pointer" },
   workerBar: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, background: "#EDF1F3", border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 14px", fontSize: 13.5, color: T.ink },
   workerSignOut: { background: "transparent", color: T.steel, border: `1px solid ${T.steelSoft}`, borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600 },
+  noPinNote: { fontSize: 12, color: T.inkSoft, fontStyle: "italic", alignSelf: "center" },
+  pinMeta: { fontSize: 12, color: T.inkSoft, marginTop: 8, lineHeight: 1.5 },
   main: { flex: 1, padding: "20px 16px calc(100px + env(safe-area-inset-bottom))", overflowY: "auto" },
 
   pinWrap: { display: "flex", justifyContent: "center", paddingTop: 24 },
