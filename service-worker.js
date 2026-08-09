@@ -4,7 +4,7 @@
      show up on the next launch instead of being stuck in cache forever.
    - Cross-origin (CDN libs, fonts, Supabase) is network-first with an
      offline cache fallback, so live data stays fresh when online. */
-const CACHE = "gangbox-v9";
+const CACHE = "gangbox-v10";
 const SHELL = [
   "./", "./index.html", "./config.js", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./icon-512-maskable.png",

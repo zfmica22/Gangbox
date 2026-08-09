@@ -701,10 +701,42 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
     return <div><SectionLabel n="01">Fix a time card</SectionLabel><Empty>Sign in on the Clock tab first — then you can fix your own time here.</Empty></div>;
   }
 
-  const cutoff = addDays(now, -28).getTime();
+  const [preset, setPreset] = useState("14d");
+  const [cStart, setCStart] = useState(toInput(addDays(now, -6)));
+  const [cEnd, setCEnd] = useState(toInput(now));
+  const [groupBy, setGroupBy] = useState("day");
+
+  let from, to;
+  if (preset === "all") { from = new Date(2000, 0, 1); to = endOfDay(now); }
+  else if (preset === "custom") { from = startOfDay(fromInput(cStart)); to = endOfDay(fromInput(cEnd)); }
+  else { const days = { "7d": 7, "14d": 14, "28d": 28 }[preset] || 14; from = startOfDay(addDays(now, -(days - 1))); to = endOfDay(now); }
+  if (to < from) { const t = from; from = startOfDay(to); to = endOfDay(t); }
+
   const mine = data.entries
-    .filter(e => e.employeeId === empId && (!e.clockOut || new Date(e.clockIn).getTime() >= cutoff))
+    .filter(e => e.employeeId === empId)
+    .filter(e => { const t = new Date(e.clockIn).getTime(); return !e.clockOut || (t >= from.getTime() && t <= to.getTime()); })
     .sort((a, b) => (a.clockOut ? 1 : 0) - (b.clockOut ? 1 : 0) || new Date(b.clockIn) - new Date(a.clockIn));
+
+  const ranged = data.entries.filter(e => e.employeeId === empId && (() => { const t = new Date(e.clockIn).getTime(); return t >= from.getTime() && t <= to.getTime(); })());
+  const rangeTotal = ranged.reduce((a, e) => a + hoursOf(e, now), 0);
+  const rangeLabel = preset === "all" ? "All time" : `${fmtDay(from)} – ${fmtDay(to)} · ${dayCount(from, to)} days`;
+
+  const groupRows = (() => {
+    const m = {};
+    ranged.forEach(e => {
+      let key, sub;
+      if (groupBy === "site") { key = (siteById(e.siteId) || {}).name || "Unknown site"; sub = e.task || "No task"; }
+      else if (groupBy === "task") { key = e.task || "No task"; sub = (siteById(e.siteId) || {}).name || "Unknown site"; }
+      else { const d = startOfDay(new Date(e.clockIn)); key = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }); sub = (siteById(e.siteId) || {}).name || "Unknown site"; }
+      if (!m[key]) m[key] = { key, hours: 0, punches: 0, subs: {}, sort: groupBy === "day" ? startOfDay(new Date(e.clockIn)).getTime() : 0 };
+      const h = hoursOf(e, now);
+      m[key].hours += h; m[key].punches += 1;
+      m[key].subs[sub] = (m[key].subs[sub] || 0) + h;
+    });
+    const rows = Object.values(m);
+    return groupBy === "day" ? rows.sort((a, b) => b.sort - a.sort) : rows.sort((a, b) => b.hours - a.hours);
+  })();
+  const groupMax = Math.max(1, ...groupRows.map(r => r.hours));
   const editsByEntry = {};
   (data.edits || []).forEach(x => { if (x.entryId) (editsByEntry[x.entryId] = editsByEntry[x.entryId] || []).push(x); });
 
@@ -720,6 +752,48 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
 
       {empId && (
         <>
+          <div style={styles.rangeBar}>
+            <div style={styles.rangeChips}>
+              {[["7d", "1 week"], ["14d", "2 weeks"], ["28d", "4 weeks"], ["all", "All"], ["custom", "Custom"]].map(([id, label]) => <button key={id} onClick={() => setPreset(id)} style={{ ...styles.rangeChip, ...(preset === id ? styles.rangeChipSel : {}) }}>{label}</button>)}
+            </div>
+            {preset === "custom" && (
+              <div style={styles.customRange}>
+                <label style={styles.dateField}><span style={styles.dateLbl}>From</span><input type="date" value={cStart} max={cEnd} onChange={(e) => setCStart(e.target.value)} style={styles.dateInput} /></label>
+                <span style={{ color: T.steelSoft, paddingTop: 18 }}>→</span>
+                <label style={styles.dateField}><span style={styles.dateLbl}>To</span><input type="date" value={cEnd} min={cStart} max={toInput(now)} onChange={(e) => setCEnd(e.target.value)} style={styles.dateInput} /></label>
+              </div>
+            )}
+            <div style={styles.rangeReadout}><span style={styles.liveDot} /> {rangeLabel} · {ranged.length} punches</div>
+          </div>
+
+          <div style={styles.totalBox}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: 1.4, color: T.inkSoft, fontWeight: 700 }}>TOTAL HOURS</div>
+              <div style={{ fontSize: 12.5, color: T.inkSoft, marginTop: 3 }}>{(empById(empId) || {}).name} · {rangeLabel}</div>
+            </div>
+            <div style={styles.totalNum}>{fmtDec(rangeTotal)}</div>
+          </div>
+
+          <div style={styles.groupToggle}>
+            {[["day", "By day"], ["site", "By job site"], ["task", "By task"]].map(([id, label]) => <button key={id} onClick={() => setGroupBy(id)} style={{ ...styles.rangeChip, ...(groupBy === id ? styles.rangeChipSel : {}) }}>{label}</button>)}
+          </div>
+
+          {groupRows.length === 0 ? <Empty>No hours in this date range.</Empty> : (
+            <div style={{ display: "grid", gap: 8, marginBottom: 22 }}>
+              {groupRows.map(r => (
+                <div key={r.key} style={styles.groupRow}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+                    <span style={{ fontWeight: 600, fontSize: 14 }}>{r.key}</span>
+                    <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 15, fontWeight: 600, color: T.steel }}>{fmtDec(r.hours)} h</span>
+                  </div>
+                  <div style={styles.groupBarTrack}><div style={{ ...styles.groupBarFill, width: `${Math.max(3, (r.hours / groupMax) * 100)}%` }} /></div>
+                  <div style={styles.groupSubs}>{Object.entries(r.subs).sort((a, b) => b[1] - a[1]).map(([k, v]) => <span key={k} style={styles.groupSubPill}>{k} · {fmtDec(v)}h</span>)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <SectionLabel n="02">Individual punches</SectionLabel>
           {editing === "new" ? (
             <EntryEditor mode="new" entry={null} sites={data.sites} tasks={data.tasks}
               onCancel={() => setEditing(null)}
@@ -728,7 +802,7 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
             <button style={{ ...styles.aiBtn, width: "100%", marginBottom: 16 }} onClick={() => setEditing("new")}>+ Add a missed shift</button>
           )}
 
-          {mine.length === 0 ? <Empty>No shifts in the last 4 weeks for {(empById(empId) || {}).name?.split(" ")[0]}.</Empty> : (
+          {mine.length === 0 ? <Empty>No shifts in this date range for {(empById(empId) || {}).name?.split(" ")[0]}.</Empty> : (
             <div style={{ display: "grid", gap: 10 }}>
               {mine.map(e => {
                 const site = siteById(e.siteId); const open = !e.clockOut;
@@ -1122,6 +1196,14 @@ const styles = {
   workerSignOut: { background: "transparent", color: T.steel, border: `1px solid ${T.steelSoft}`, borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600 },
   noPinNote: { fontSize: 12, color: T.inkSoft, fontStyle: "italic", alignSelf: "center" },
   pinMeta: { fontSize: 12, color: T.inkSoft, marginTop: 8, lineHeight: 1.5 },
+  totalBox: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, background: T.ink, color: "#fff", borderRadius: 12, padding: "16px 18px", marginBottom: 14 },
+  totalNum: { fontFamily: "'JetBrains Mono',monospace", fontSize: 34, fontWeight: 700, color: T.amber, lineHeight: 1 },
+  groupToggle: { display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 },
+  groupRow: { background: "#fff", border: `1px solid ${T.line}`, borderRadius: 10, padding: "12px 14px" },
+  groupBarTrack: { height: 6, background: "#EDF1F3", borderRadius: 4, marginTop: 9, overflow: "hidden" },
+  groupBarFill: { height: "100%", background: T.steel, borderRadius: 4 },
+  groupSubs: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 9 },
+  groupSubPill: { fontSize: 11.5, color: T.inkSoft, background: "#F2F5F6", border: `1px solid ${T.line}`, borderRadius: 20, padding: "3px 9px" },
   main: { flex: 1, padding: "20px 16px calc(100px + env(safe-area-inset-bottom))", overflowY: "auto" },
 
   pinWrap: { display: "flex", justifyContent: "center", paddingTop: 24 },
