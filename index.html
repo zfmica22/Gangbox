@@ -185,6 +185,7 @@ function App() {
   const [online, setOnline] = useState(navigator.onLine);
   const [pending, setPending] = useState(outboxCount(loadOutbox()));
   const [toast, setToast] = useState(null);
+  const [worker, setWorker] = useState(() => localStorage.getItem("gangbox_worker") || null);
   const [syncState, setSyncState] = useState(IS_CLOUD ? "loading" : "local"); // loading | ok | error | local
   const [cloudPin, setCloudPin] = useState(null);
   const [localPin, setLocalPin] = useState(() => localStorage.getItem("gangbox_local_pin") || "1234");
@@ -279,18 +280,21 @@ function App() {
 
   /* ---- mutations (optimistic + cloud) ---- */
   const clockIn = (employeeId, siteId, loc, task) => {
+    if (!canAct(employeeId)) return blocked();
     const e = { id: uuid(), employeeId, siteId, clockIn: new Date().toISOString(), clockOut: null, lat: loc?.lat ?? null, lng: loc?.lng ?? null, task: task || "" };
     setData(d => ({ ...d, entries: [...d.entries, e] }));
     enqueueEntry(e);
   };
   const clockOut = (id) => {
     const cur = dataRef.current.entries.find(e => e.id === id); if (!cur) return;
+    if (!canAct(cur.employeeId)) return blocked();
     const upd = { ...cur, clockOut: new Date().toISOString() };
     setData(d => ({ ...d, entries: d.entries.map(e => e.id === id ? upd : e) }));
     enqueueEntry(upd);
   };
   const setTask = (id, task) => {
     const cur = dataRef.current.entries.find(e => e.id === id); if (!cur) return;
+    if (!canAct(cur.employeeId)) return blocked();
     const upd = { ...cur, task };
     setData(d => ({ ...d, entries: d.entries.map(e => e.id === id ? upd : e) }));
     enqueueEntry(upd);
@@ -300,12 +304,14 @@ function App() {
   const serialize = (f, v) => { if (v == null || v === "") return null; if (f === "site") { const s = siteById(v); return s ? s.name : String(v); } return String(v); };
   const editEntryFields = (entryId, changes, note) => {
     const cur = dataRef.current.entries.find(e => e.id === entryId); if (!cur) return;
+    if (!canAct(cur.employeeId)) return blocked();
     const emp = empById(cur.employeeId);
+    const fullNote = `${note || "Edited"} · by ${actorLabel()}`;
     const specs = [["clockIn", "clock_in"], ["clockOut", "clock_out"], ["task", "task"], ["siteId", "site"]];
     const audits = []; const upd = { ...cur };
     specs.forEach(([k, fld]) => {
       if (k in changes && (changes[k] ?? null) !== (cur[k] ?? null)) {
-        audits.push(auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "edited", field: fld, oldValue: serialize(fld, cur[k]), newValue: serialize(fld, changes[k]), note }));
+        audits.push(auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "edited", field: fld, oldValue: serialize(fld, cur[k]), newValue: serialize(fld, changes[k]), note: fullNote }));
         upd[k] = changes[k];
       }
     });
@@ -315,16 +321,18 @@ function App() {
     enqueueEdits(audits);
   };
   const addMissedShift = (employeeId, siteId, clockInISO, clockOutISO, task) => {
+    if (!canAct(employeeId)) return blocked();
     const e = { id: uuid(), employeeId, siteId, clockIn: clockInISO, clockOut: clockOutISO || null, lat: null, lng: null, task: task || "" };
     const emp = empById(employeeId);
-    const a = auditRow({ entryId: e.id, employeeId, employeeName: emp ? emp.name : null, action: "created", oldValue: null, newValue: `in ${fmtStamp(clockInISO)}${clockOutISO ? ` → out ${fmtStamp(clockOutISO)}` : " (open)"}`, note: "Missed shift added manually" });
+    const a = auditRow({ entryId: e.id, employeeId, employeeName: emp ? emp.name : null, action: "created", oldValue: null, newValue: `in ${fmtStamp(clockInISO)}${clockOutISO ? ` → out ${fmtStamp(clockOutISO)}` : " (open)"}`, note: `Missed shift added · by ${actorLabel()}` });
     setData(d => ({ ...d, entries: [...d.entries, e], edits: [mapEdit(a), ...(d.edits || [])] }));
     enqueueEntry(e); enqueueEdits([a]);
   };
   const deleteEntry = (entryId, note) => {
     const cur = dataRef.current.entries.find(e => e.id === entryId); if (!cur) return;
+    if (!canAct(cur.employeeId)) return blocked();
     const emp = empById(cur.employeeId);
-    const a = auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "deleted", oldValue: `in ${fmtStamp(cur.clockIn)}${cur.clockOut ? ` → out ${fmtStamp(cur.clockOut)}` : " (open)"}`, newValue: null, note: note || "Time card deleted" });
+    const a = auditRow({ entryId, employeeId: cur.employeeId, employeeName: emp ? emp.name : null, action: "deleted", oldValue: `in ${fmtStamp(cur.clockIn)}${cur.clockOut ? ` → out ${fmtStamp(cur.clockOut)}` : " (open)"}`, newValue: null, note: `${note || "Time card deleted"} · by ${actorLabel()}` });
     setData(d => ({ ...d, entries: d.entries.filter(e => e.id !== entryId), edits: [mapEdit(a), ...(d.edits || [])] }));
     enqueueDelete(entryId); enqueueEdits([a]);
   };
@@ -361,6 +369,25 @@ function App() {
   const resetLocal = () => { if (confirm("Reset all data back to the sample crew and jobs on this device?")) { const s = buildSeed(); setData(s); } };
 
   const effectivePin = IS_CLOUD ? cloudPin : localPin;
+  /* ---- employee logins ---- */
+  const empPinSet = async (eid) => {
+    if (IS_CLOUD) { try { const { data } = await client.rpc("employee_pin_set", { eid }); return !!data; } catch { return false; } }
+    try { return !!JSON.parse(localStorage.getItem("gangbox_emp_pins") || "{}")[eid]; } catch { return false; }
+  };
+  const verifyEmpPin = async (eid, p) => {
+    if (IS_CLOUD) { try { const { data } = await client.rpc("verify_employee_pin", { eid, p }); return !!data; } catch { return false; } }
+    try { return JSON.parse(localStorage.getItem("gangbox_emp_pins") || "{}")[eid] === p; } catch { return false; }
+  };
+  const setEmpPin = async (eid, p) => {
+    if (IS_CLOUD) { const { error } = await client.from("employee_pins").upsert({ employee_id: eid, pin: p }); return !error; }
+    try { const m = JSON.parse(localStorage.getItem("gangbox_emp_pins") || "{}"); m[eid] = p; localStorage.setItem("gangbox_emp_pins", JSON.stringify(m)); return true; } catch { return false; }
+  };
+  const signIn = (eid) => { setWorker(eid); localStorage.setItem("gangbox_worker", eid); const e = empById(eid); showToast(`Signed in as ${e ? e.name.split(" ")[0] : "you"}`, "ok"); };
+  const signOut = () => { setWorker(null); localStorage.removeItem("gangbox_worker"); showToast("Signed out", "ok"); };
+  const canAct = (eid) => unlocked || worker === eid;
+  const actorLabel = () => unlocked ? "manager" : (worker ? `${(empById(worker) || {}).name || "worker"} (self)` : "unknown");
+  const blocked = () => { showToast("You can only change your own time. Sign in as that person, or unlock manager mode.", "err"); };
+
   const unlock = () => { setUnlocked(true); localStorage.setItem("gangbox_unlocked", "1"); showToast("Manager view unlocked", "ok"); };
   const lock = () => { setUnlocked(false); localStorage.removeItem("gangbox_unlocked"); };
 
@@ -375,8 +402,8 @@ function App() {
       )}
       {toast && <div style={{ ...styles.toast, ...(toast.kind === "ok" ? styles.toastOk : styles.toastErr) }}>{(toast.kind === "ok" ? "✓ " : "⚠ ") + toast.msg}</div>}
       <main style={styles.main}>
-        {tab === "clock" && <ClockTab data={data} now={now} empById={empById} siteById={siteById} onClockIn={clockIn} onClockOut={clockOut} onSetTask={setTask} onAddTaskType={addTaskType} onOpenCard={(id) => { setCardEmp(id); setTab("cards"); }} />}
-        {tab === "cards" && <CardsTab data={data} now={now} empById={empById} siteById={siteById} initialEmp={cardEmp} onEdit={editEntryFields} onCreate={addMissedShift} onDelete={deleteEntry} />}
+        {tab === "clock" && <ClockTab data={data} now={now} empById={empById} siteById={siteById} onClockIn={clockIn} onClockOut={clockOut} onSetTask={setTask} onAddTaskType={addTaskType} onOpenCard={(id) => { setCardEmp(id); setTab("cards"); }} manager={unlocked} worker={worker} effectivePin={effectivePin} onUnlockManager={unlock} onSignIn={signIn} onSignOut={signOut} empPinSet={empPinSet} verifyEmpPin={verifyEmpPin} setEmpPin={setEmpPin} />}
+        {tab === "cards" && <CardsTab data={data} now={now} empById={empById} siteById={siteById} initialEmp={cardEmp} onEdit={editEntryFields} onCreate={addMissedShift} onDelete={deleteEntry} manager={unlocked} worker={worker} />}
         {needPin && <PinGate effectivePin={effectivePin} onUnlock={unlock} onCreate={(p) => { changePin(p); unlock(); }} />}
         {!needPin && tab === "sites" && <SitesTab data={data} now={now} onAdd={addSite} />}
         {!needPin && tab === "crew" && <CrewTab data={data} now={now} onAdd={addEmployee} trades={data.trades} onAddTrade={addTrade} onRemoveTrade={removeTrade} />}
@@ -437,7 +464,76 @@ function PinGate({ effectivePin, onUnlock, onCreate }) {
 }
 
 /* ===================== clock ===================== */
-function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTask, onAddTaskType, onOpenCard }) {
+function ManagerUnlock({ effectivePin, onUnlock }) {
+  const [open, setOpen] = useState(false);
+  if (open) return <div style={{ marginTop: 16 }}><PinGate effectivePin={effectivePin} onUnlock={onUnlock} onCreate={onUnlock} /></div>;
+  return <button style={{ ...styles.footBtn, marginTop: 16 }} onClick={() => setOpen(true)}>I’m a manager →</button>;
+}
+
+function WorkerBar({ manager, worker, empById, onSignOut }) {
+  if (manager) return <div style={styles.workerBar}><span><b>Manager mode.</b> You can punch or fix anyone.</span></div>;
+  const e = empById(worker);
+  return <div style={styles.workerBar}><span>Signed in as <b>{e ? e.name : "—"}</b></span><button style={styles.workerSignOut} onClick={onSignOut}>Sign out</button></div>;
+}
+
+function SignIn({ data, empById, empPinSet, verifyEmpPin, setEmpPin, onSignIn, effectivePin, onUnlockManager }) {
+  const [empId, setEmpId] = useState("");
+  const [state, setState] = useState("pick"); // pick | checking | enter | create
+  const [pin, setPin] = useState(""); const [pin2, setPin2] = useState(""); const [err, setErr] = useState("");
+  const emp = empId ? empById(empId) : null;
+  const first = emp ? emp.name.split(" ")[0] : "";
+
+  const choose = async (id) => {
+    setEmpId(id); setErr(""); setPin(""); setPin2(""); setState("checking");
+    const has = await empPinSet(id); setState(has ? "enter" : "create");
+  };
+  const doEnter = async () => {
+    setErr(""); const ok = await verifyEmpPin(empId, pin);
+    if (ok) onSignIn(empId); else { setErr("That PIN didn't match."); setPin(""); }
+  };
+  const doCreate = async () => {
+    if (pin.trim().length < 4) { setErr("Use at least 4 digits."); return; }
+    if (pin !== pin2) { setErr("PINs don't match."); return; }
+    const ok = await setEmpPin(empId, pin.trim());
+    if (ok) onSignIn(empId); else setErr("Couldn't save PIN — check your connection and try again.");
+  };
+
+  if (state === "pick" || state === "checking") {
+    return (
+      <div>
+        <SectionLabel n="01">Sign in</SectionLabel>
+        <div style={styles.punchPanel}>
+          <FieldLabel>Who are you?</FieldLabel>
+          {data.employees.length === 0 ? <div style={{ fontSize: 13.5, color: T.inkSoft }}>No crew added yet. A manager adds the crew in the Crew tab.</div> : (
+            <div style={styles.chipWrap}>
+              {data.employees.map(e => <button key={e.id} onClick={() => choose(e.id)} style={{ ...styles.chip, ...(empId === e.id ? styles.chipSel : {}) }}>{e.name.split(" ")[0]}</button>)}
+            </div>
+          )}
+          {state === "checking" && <div style={styles.hint}>Checking…</div>}
+          <ManagerUnlock effectivePin={effectivePin} onUnlock={onUnlockManager} />
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <SectionLabel n="01">Sign in</SectionLabel>
+      <div style={styles.pinWrap}>
+        <div style={styles.pinCard}>
+          <div style={styles.pinTitle}>{state === "create" ? `SET ${first.toUpperCase()}'S PIN` : `${first.toUpperCase()}, ENTER YOUR PIN`}</div>
+          <div style={styles.pinSub}>{state === "create" ? "First time signing in — pick a PIN you'll use to clock in and out." : "Enter your PIN to clock in and out."}</div>
+          <input type="password" inputMode="numeric" autoFocus value={pin} placeholder="••••" onChange={(e) => { setPin(e.target.value); setErr(""); }} onKeyDown={(e) => e.key === "Enter" && (state === "create" ? doCreate() : doEnter())} style={styles.pinInput} />
+          {state === "create" && <input type="password" inputMode="numeric" value={pin2} placeholder="confirm PIN" onChange={(e) => { setPin2(e.target.value); setErr(""); }} style={{ ...styles.pinInput, marginTop: 10 }} />}
+          {err && <div style={styles.pinErr}>{err}</div>}
+          <button style={styles.pinBtn} onClick={state === "create" ? doCreate : doEnter}>{state === "create" ? "Save & sign in" : "Sign in"}</button>
+          <button style={{ ...styles.footBtn, marginTop: 12 }} onClick={() => { setState("pick"); setEmpId(""); setErr(""); }}>← Back</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTask, onAddTaskType, onOpenCard, manager, worker, effectivePin, onUnlockManager, onSignIn, onSignOut, empPinSet, verifyEmpPin, setEmpPin }) {
   const active = data.entries.filter(e => !e.clockOut);
   const editedIds = new Set((data.edits || []).filter(x => x.action !== "deleted").map(x => x.entryId));
   const [empId, setEmpId] = useState("");
@@ -446,29 +542,37 @@ function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTa
   const [locNote, setLocNote] = useState("");
   const [mapFor, setMapFor] = useState(null);
   const [taskFor, setTaskFor] = useState(null);
-  const myActive = empId ? active.find(e => e.employeeId === empId) : null;
+
+  const signedIn = worker && empById(worker);
+  if (!manager && !signedIn) {
+    return <SignIn data={data} empById={empById} empPinSet={empPinSet} verifyEmpPin={verifyEmpPin} setEmpPin={setEmpPin} onSignIn={onSignIn} effectivePin={effectivePin} onUnlockManager={onUnlockManager} />;
+  }
+
+  const canAct = (e) => manager || (worker && e.employeeId === worker);
+  const selectedEmp = manager ? empId : worker;
+  const myActive = selectedEmp ? active.find(e => e.employeeId === selectedEmp) : null;
+  const noSites = data.sites.length === 0;
 
   const punchIn = () => {
-    if (!empId || !siteId) return;
+    if (!selectedEmp || !siteId) return;
     setLocNote("Locating…");
-    const finish = (loc) => { onClockIn(empId, siteId, loc, task); setSiteId(""); setTask(""); setLocNote(loc ? "Location pin stamped on this punch." : "Punched in (location unavailable)."); setTimeout(() => setLocNote(""), 3500); };
+    const finish = (loc) => { onClockIn(selectedEmp, siteId, loc, task); setSiteId(""); setTask(""); setLocNote(loc ? "Location pin stamped on this punch." : "Punched in (location unavailable)."); setTimeout(() => setLocNote(""), 3500); };
     if (navigator.geolocation) navigator.geolocation.getCurrentPosition((p) => finish({ lat: p.coords.latitude, lng: p.coords.longitude }), () => finish(null), { timeout: 7000 });
     else finish(null);
   };
 
-  const noCrew = data.employees.length === 0;
-  const noSites = data.sites.length === 0;
-
   return (
     <div>
+      <WorkerBar manager={manager} worker={worker} empById={empById} onSignOut={onSignOut} />
+
       <SectionLabel n="01">On site now</SectionLabel>
       {active.length === 0 ? (
-        <Empty>{noCrew ? "No crew added yet. A manager can add the crew in the Crew tab." : "Nobody is punched in. Pick a name below to start the day."}</Empty>
+        <Empty>Nobody is punched in.</Empty>
       ) : (
         <div style={{ display: "grid", gap: 10, marginBottom: 26 }}>
           {active.map((e) => {
             const emp = empById(e.employeeId); const site = siteById(e.siteId);
-            const showMap = mapFor === e.id; const showTask = taskFor === e.id;
+            const mine = canAct(e); const showMap = mapFor === e.id; const showTask = taskFor === e.id;
             return (
               <div key={e.id} style={styles.activeCardWrap}>
                 <div style={styles.activeCardTop}>
@@ -480,16 +584,18 @@ function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTa
                   </div>
                   <div style={{ textAlign: "right", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
                     <div style={styles.elapsed}>{fmtH(hoursOf(e, now))}</div>
-                    <button style={styles.outBtn} onClick={() => onClockOut(e.id)}>CLOCK OUT</button>
+                    {mine && <button style={styles.outBtn} onClick={() => onClockOut(e.id)}>CLOCK OUT</button>}
                   </div>
                 </div>
-                <div style={styles.activeActions}>
-                  <button style={{ ...styles.lineBtn, ...(showTask ? styles.lineBtnOn : {}) }} onClick={() => { setTaskFor(showTask ? null : e.id); setMapFor(null); }}>{e.task ? "Change task" : "Assign task"}</button>
-                  <button style={{ ...styles.lineBtn, ...(showMap ? styles.lineBtnOn : {}) }} onClick={() => { setMapFor(showMap ? null : e.id); setTaskFor(null); }} disabled={!e.lat}>📍 {e.lat ? "Check-in pin" : "No location"}</button>
-                  <button style={styles.lineBtn} onClick={() => onOpenCard(e.employeeId)}>✎ Fix times</button>
-                </div>
-                {showTask && <div style={styles.expandRow}><TaskSelect tasks={data.tasks} value={e.task} onPick={(t) => { onSetTask(e.id, t); setTaskFor(null); }} onAddType={onAddTaskType} /></div>}
-                {showMap && e.lat && <div style={styles.expandRow}><LocationMap lat={e.lat} lng={e.lng} label={(emp ? emp.name.split(" ")[0] : "") + " " + clockTime(new Date(e.clockIn))} /></div>}
+                {mine && (
+                  <div style={styles.activeActions}>
+                    <button style={{ ...styles.lineBtn, ...(showTask ? styles.lineBtnOn : {}) }} onClick={() => { setTaskFor(showTask ? null : e.id); setMapFor(null); }}>{e.task ? "Change task" : "Assign task"}</button>
+                    <button style={{ ...styles.lineBtn, ...(showMap ? styles.lineBtnOn : {}) }} onClick={() => { setMapFor(showMap ? null : e.id); setTaskFor(null); }} disabled={!e.lat}>📍 {e.lat ? "Check-in pin" : "No location"}</button>
+                    <button style={styles.lineBtn} onClick={() => onOpenCard(e.employeeId)}>✎ Fix times</button>
+                  </div>
+                )}
+                {mine && showTask && <div style={styles.expandRow}><TaskSelect tasks={data.tasks} value={e.task} onPick={(t) => { onSetTask(e.id, t); setTaskFor(null); }} onAddType={onAddTaskType} /></div>}
+                {mine && showMap && e.lat && <div style={styles.expandRow}><LocationMap lat={e.lat} lng={e.lng} label={(emp ? emp.name.split(" ")[0] : "") + " " + clockTime(new Date(e.clockIn))} /></div>}
               </div>
             );
           })}
@@ -498,45 +604,48 @@ function ClockTab({ data, now, empById, siteById, onClockIn, onClockOut, onSetTa
 
       <SectionLabel n="02">Punch the clock</SectionLabel>
       <div style={styles.punchPanel}>
-        {noCrew ? (
-          <div style={{ fontSize: 13.5, color: T.inkSoft }}>Once a manager adds the crew and job sites, this is where each person taps their name and clocks in.</div>
-        ) : (
+        {manager ? (
           <>
             <FieldLabel>Crew member</FieldLabel>
-            <div style={styles.chipWrap}>
-              {data.employees.map((e) => { const on = active.find(a => a.employeeId === e.id); const sel = empId === e.id;
-                return <button key={e.id} onClick={() => setEmpId(sel ? "" : e.id)} style={{ ...styles.chip, ...(sel ? styles.chipSel : {}), ...(on && !sel ? styles.chipOn : {}) }}>{e.name.split(" ")[0]}{on ? " ●" : ""}</button>;
-              })}
-            </div>
-            {myActive ? (
-              <div style={styles.alreadyIn}>
-                <div>
-                  <div style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, letterSpacing: 0.5 }}>{(empById(myActive.employeeId) || {}).name?.split(" ")[0]?.toUpperCase()} IS ON THE CLOCK</div>
-                  <div style={{ color: T.inkSoft, fontSize: 13, marginTop: 2 }}>{(siteById(myActive.siteId) || {}).name} · {fmtH(hoursOf(myActive, now))} so far</div>
-                </div>
-                <button style={{ ...styles.outBtn, padding: "12px 18px" }} onClick={() => onClockOut(myActive.id)}>CLOCK OUT</button>
+            {data.employees.length === 0 ? <div style={{ fontSize: 13.5, color: T.inkSoft }}>Add crew in the Crew tab first.</div> : (
+              <div style={styles.chipWrap}>
+                {data.employees.map((e) => { const on = active.find(a => a.employeeId === e.id); const sel = empId === e.id;
+                  return <button key={e.id} onClick={() => setEmpId(sel ? "" : e.id)} style={{ ...styles.chip, ...(sel ? styles.chipSel : {}), ...(on && !sel ? styles.chipOn : {}) }}>{e.name.split(" ")[0]}{on ? " ●" : ""}</button>;
+                })}
               </div>
-            ) : (
-              <>
-                <FieldLabel>Job site</FieldLabel>
-                {noSites ? (
-                  <div style={{ ...styles.empty, marginBottom: 16 }}>No job sites yet. A manager can add them in the Sites tab.</div>
-                ) : (
-                  <div style={styles.siteList}>
-                    {data.sites.map((s) => { const sel = siteId === s.id;
-                      return <button key={s.id} onClick={() => setSiteId(sel ? "" : s.id)} style={{ ...styles.siteRow, ...(sel ? styles.siteRowSel : {}) }}>
-                        <div style={{ textAlign: "left" }}><div style={{ fontWeight: 600, fontSize: 14 }}>{s.name}</div><div style={{ fontSize: 12, color: T.inkSoft }}>{s.customer} · {s.address}</div></div>
-                        <span style={styles.typeBadge}>{s.type}</span></button>;
-                    })}
-                  </div>
-                )}
-                <FieldLabel>Task <span style={{ textTransform: "none", letterSpacing: 0, fontWeight: 400 }}>(optional — can be set later)</span></FieldLabel>
-                <TaskSelect tasks={data.tasks} value={task} onPick={setTask} onAddType={onAddTaskType} compact />
-                <button onClick={punchIn} disabled={!empId || !siteId} style={{ ...styles.bigPunch, ...(!empId || !siteId ? styles.bigPunchOff : {}), marginTop: 16 }}><span style={styles.bigPunchInner}>CLOCK IN</span></button>
-                {locNote && <div style={styles.locNote}>{locNote}</div>}
-                {(!empId || !siteId) && !noSites && <div style={styles.hint}>Pick a crew member and a job site to punch in.</div>}
-              </>
             )}
+          </>
+        ) : (
+          <div style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, letterSpacing: 0.5, marginBottom: 14 }}>CLOCKING IN AS {(empById(worker) || {}).name?.split(" ")[0]?.toUpperCase()}</div>
+        )}
+
+        {myActive ? (
+          <div style={styles.alreadyIn}>
+            <div>
+              <div style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, letterSpacing: 0.5 }}>{(empById(myActive.employeeId) || {}).name?.split(" ")[0]?.toUpperCase()} IS ON THE CLOCK</div>
+              <div style={{ color: T.inkSoft, fontSize: 13, marginTop: 2 }}>{(siteById(myActive.siteId) || {}).name} · {fmtH(hoursOf(myActive, now))} so far</div>
+            </div>
+            <button style={{ ...styles.outBtn, padding: "12px 18px" }} onClick={() => onClockOut(myActive.id)}>CLOCK OUT</button>
+          </div>
+        ) : (
+          <>
+            <FieldLabel>Job site</FieldLabel>
+            {noSites ? (
+              <div style={{ ...styles.empty, marginBottom: 16 }}>No job sites yet. A manager can add them in the Sites tab.</div>
+            ) : (
+              <div style={styles.siteList}>
+                {data.sites.map((s) => { const sel = siteId === s.id;
+                  return <button key={s.id} onClick={() => setSiteId(sel ? "" : s.id)} style={{ ...styles.siteRow, ...(sel ? styles.siteRowSel : {}) }}>
+                    <div style={{ textAlign: "left" }}><div style={{ fontWeight: 600, fontSize: 14 }}>{s.name}</div><div style={{ fontSize: 12, color: T.inkSoft }}>{s.customer} · {s.address}</div></div>
+                    <span style={styles.typeBadge}>{s.type}</span></button>;
+                })}
+              </div>
+            )}
+            <FieldLabel>Task <span style={{ textTransform: "none", letterSpacing: 0, fontWeight: 400 }}>(optional — can be set later)</span></FieldLabel>
+            <TaskSelect tasks={data.tasks} value={task} onPick={setTask} onAddType={onAddTaskType} compact />
+            <button onClick={punchIn} disabled={!selectedEmp || !siteId} style={{ ...styles.bigPunch, ...(!selectedEmp || !siteId ? styles.bigPunchOff : {}), marginTop: 16 }}><span style={styles.bigPunchInner}>CLOCK IN</span></button>
+            {locNote && <div style={styles.locNote}>{locNote}</div>}
+            {manager && !empId && <div style={styles.hint}>Pick a crew member and a job site to punch in.</div>}
           </>
         )}
       </div>
@@ -577,11 +686,15 @@ function LocationMap({ lat, lng, label }) {
 }
 
 /* ===================== cards (edit time) ===================== */
-function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, onDelete }) {
-  const [empId, setEmpId] = useState(initialEmp || "");
-  const [editing, setEditing] = useState(null); // entry id, or "new", or null
+function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, onDelete, manager, worker }) {
+  const [empId, setEmpId] = useState(manager ? (initialEmp || "") : (worker || ""));
+  const [editing, setEditing] = useState(null);
   const [histFor, setHistFor] = useState(null);
-  useEffect(() => { if (initialEmp) setEmpId(initialEmp); }, [initialEmp]);
+  useEffect(() => { if (manager && initialEmp) setEmpId(initialEmp); if (!manager) setEmpId(worker || ""); }, [initialEmp, manager, worker]);
+
+  if (!manager && !(worker && empById(worker))) {
+    return <div><SectionLabel n="01">Fix a time card</SectionLabel><Empty>Sign in on the Clock tab first — then you can fix your own time here.</Empty></div>;
+  }
 
   const cutoff = addDays(now, -28).getTime();
   const mine = data.entries
@@ -593,12 +706,12 @@ function CardsTab({ data, now, empById, siteById, initialEmp, onEdit, onCreate, 
   return (
     <div>
       <SectionLabel n="01">Fix a time card</SectionLabel>
-      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>Forgot to clock in or out? Pick your name, then fix the time. Every change is logged for the office.</div>
-      {data.employees.length === 0 ? <Empty>No crew yet. A manager adds the crew in the Crew tab.</Empty> : (
+      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>Forgot to clock in or out? {manager ? "Pick a crew member, then fix the time." : "Fix your clock-in or clock-out below."} Every change is logged for the office.</div>
+      {manager && (data.employees.length === 0 ? <Empty>No crew yet.</Empty> : (
         <div style={styles.chipWrap}>
           {data.employees.map(e => <button key={e.id} onClick={() => { setEmpId(e.id); setEditing(null); }} style={{ ...styles.chip, ...(empId === e.id ? styles.chipSel : {}) }}>{e.name.split(" ")[0]}</button>)}
         </div>
-      )}
+      ))}
 
       {empId && (
         <>
@@ -776,7 +889,7 @@ function TradeManager({ trades, onAdd, onRemove }) {
   const commit = () => { const t = draft.trim(); if (!t) return; onAdd(t); setDraft(""); };
   return (
     <div style={styles.card}>
-      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>These are the trade options shown when adding a crew member. Removing one here doesn't change anyone already assigned to it.</div>
+      <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 12 }}>These are the trade options shown when adding a crew member. Removing one here doesn’t change anyone already assigned to it.</div>
       <div style={styles.taskGrid}>
         {trades.map(t => (
           <span key={t} style={styles.tradeChipManage}>{t}<span style={styles.tradeX} onClick={() => { if (confirm(`Remove “${t}” from the trade list?`)) onRemove(t); }}>×</span></span>
@@ -992,6 +1105,8 @@ const styles = {
   toastErr: { background: "#F6E3D2", color: T.warn, borderBottom: `1px solid #E6C9AE` },
   tradeChipManage: { display: "inline-flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: T.steel, background: "#EDF1F3", border: `1px solid ${T.line}`, padding: "7px 8px 7px 12px", borderRadius: 20 },
   tradeX: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 18, height: 18, borderRadius: "50%", background: "#D7DEE2", color: T.steel, fontSize: 14, lineHeight: 1, cursor: "pointer" },
+  workerBar: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, background: "#EDF1F3", border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 14px", fontSize: 13.5, color: T.ink },
+  workerSignOut: { background: "transparent", color: T.steel, border: `1px solid ${T.steelSoft}`, borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600 },
   main: { flex: 1, padding: "20px 16px calc(100px + env(safe-area-inset-bottom))", overflowY: "auto" },
 
   pinWrap: { display: "flex", justifyContent: "center", paddingTop: 24 },
